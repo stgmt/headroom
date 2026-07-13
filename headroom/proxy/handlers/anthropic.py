@@ -38,6 +38,20 @@ from headroom.proxy.outcome import RequestOutcome
 logger = logging.getLogger("headroom.proxy")
 
 
+# sub2api downstream Claude Code session key patch
+def _headroom_session_header_from_request(request: Any) -> str | None:
+    explicit = request.headers.get("x-headroom-session-id")
+    if explicit:
+        return explicit
+
+    claude_session = request.headers.get("x-claude-code-session-id")
+    if not claude_session:
+        return None
+
+    claude_agent = request.headers.get("x-claude-code-agent-id") or "main"
+    return f"claude-code:{claude_session}:{claude_agent}"
+
+
 def _strip_streaming_only_content_fields(messages: Any) -> None:
     """Remove streaming-only ``index`` keys from request content blocks, in place.
 
@@ -2560,13 +2574,22 @@ class AnthropicHandlerMixin:
                     await _finalize_pre_upstream()
                     session_key = self._get_session_key(
                         body,
-                        session_header=request.headers.get("x-headroom-session-id"),
+                        session_header=_headroom_session_header_from_request(request),
                     )
                     if session_key in self._active_streams:
-                        from fastapi.responses import JSONResponse
-
-                        queued = self._queue_mid_turn_message(session_key, body)
-                        return JSONResponse(content=queued, status_code=202)
+                        # sub2api downstream Claude Code no-202 overlap patch
+                        waited_ms = await self._wait_for_mid_turn_stream(
+                            session_key,
+                            request_id,
+                        )
+                        if session_key in self._active_streams:
+                            logger.warning(
+                                "event=mid_turn_overlap_timeout request_id=%s "
+                                "session_key=%s waited_ms=%.2f action=forward_anyway",
+                                request_id,
+                                session_key,
+                                waited_ms,
+                            )
                     return await self._stream_response(
                         url,
                         headers,
@@ -3894,3 +3917,165 @@ class AnthropicHandlerMixin:
             status_code=200,
             media_type="application/jsonl",
         )
+
+
+
+# sub2api downstream Claude Code handler watchdog patch
+_sub2api_original_handle_anthropic_messages = (
+    AnthropicHandlerMixin.handle_anthropic_messages
+)
+
+
+async def _sub2api_handle_anthropic_messages_with_watchdog(
+    self,
+    request,
+    upstream_base_url=None,
+    provider_name="anthropic",
+    model_override=None,
+    force_stream=False,
+):
+    import asyncio as _sub2api_asyncio
+    import json as _sub2api_json
+    import os as _sub2api_os
+
+    claude_session = request.headers.get("x-claude-code-session-id")
+    if not claude_session:
+        return await _sub2api_original_handle_anthropic_messages(
+            self,
+            request,
+            upstream_base_url=upstream_base_url,
+            provider_name=provider_name,
+            model_override=model_override,
+            force_stream=force_stream,
+        )
+
+    raw_timeout_ms = _sub2api_os.environ.get(
+        "HEADROOM_CLAUDE_CODE_HANDLER_WATCHDOG_MS",
+        "540000",
+    )
+    try:
+        timeout_ms = max(1000, int(raw_timeout_ms))
+    except (TypeError, ValueError):
+        timeout_ms = 540000
+
+    claude_agent = request.headers.get("x-claude-code-agent-id") or "main"
+
+    class _Sub2apiWatchdogRetryRequest:
+        def __init__(self, original_request, retry_headers):
+            self._original_request = original_request
+            self.headers = retry_headers
+
+        def __getattr__(self, name):
+            return getattr(self._original_request, name)
+
+    def _consume_late_task_result(task):
+        try:
+            task.result()
+        except _sub2api_asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning(
+                "event=claude_code_handler_watchdog_late_task_error "
+                "session_id=%s agent_id=%s error=%r",
+                claude_session,
+                claude_agent,
+                exc,
+            )
+
+    async def _run_original(current_request):
+        return await _sub2api_original_handle_anthropic_messages(
+            self,
+            current_request,
+            upstream_base_url=upstream_base_url,
+            provider_name=provider_name,
+            model_override=model_override,
+            force_stream=force_stream,
+        )
+
+    async def _run_with_watchdog(current_request, attempt):
+        task = _sub2api_asyncio.create_task(_run_original(current_request))
+        done, _ = await _sub2api_asyncio.wait(
+            {task},
+            timeout=timeout_ms / 1000.0,
+        )
+        if task in done:
+            return False, await task
+
+        task.cancel()
+        task.add_done_callback(_consume_late_task_result)
+        logger.error(
+            "event=claude_code_handler_watchdog_timeout "
+            "session_id=%s agent_id=%s timeout_ms=%s attempt=%s",
+            claude_session,
+            claude_agent,
+            timeout_ms,
+            attempt,
+        )
+        return True, None
+
+    timed_out, response = await _run_with_watchdog(request, "primary")
+    if not timed_out:
+        return response
+
+    retry_headers = dict(request.headers.items())
+    retry_headers["x-headroom-bypass"] = "true"
+    retry_headers["x-headroom-mode"] = "passthrough"
+    retry_headers["x-sub2api-headroom-watchdog-retry"] = "1"
+    retry_request = _Sub2apiWatchdogRetryRequest(request, retry_headers)
+    logger.warning(
+        "event=claude_code_handler_watchdog_retry "
+        "session_id=%s agent_id=%s mode=bypass",
+        claude_session,
+        claude_agent,
+    )
+
+    retry_timed_out, retry_response = await _run_with_watchdog(
+        retry_request,
+        "bypass",
+    )
+    if not retry_timed_out:
+        logger.warning(
+            "event=claude_code_handler_watchdog_retry_ok "
+            "session_id=%s agent_id=%s",
+            claude_session,
+            claude_agent,
+        )
+        return retry_response
+
+    from fastapi.responses import StreamingResponse
+
+    logger.error(
+        "event=claude_code_handler_watchdog_retry_timeout "
+        "session_id=%s agent_id=%s timeout_ms=%s",
+        claude_session,
+        claude_agent,
+        timeout_ms,
+    )
+
+    async def _timeout_sse():
+        error_event = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": (
+                    "Headroom timed out before producing an Anthropic stream "
+                    "event. A local bypass retry was attempted and also timed "
+                    "out."
+                ),
+            },
+        }
+        yield (
+            "event: error\n"
+            f"data: {_sub2api_json.dumps(error_event)}\n\n"
+        ).encode()
+
+    return StreamingResponse(
+        _timeout_sse(),
+        media_type="text/event-stream",
+        status_code=504,
+    )
+
+
+AnthropicHandlerMixin.handle_anthropic_messages = (
+    _sub2api_handle_anthropic_messages_with_watchdog
+)

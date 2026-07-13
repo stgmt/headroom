@@ -168,6 +168,28 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
     if config.embedder_backend == EmbedderBackend.OPENAI and not config.openai_api_key:
         raise ValueError("openai_api_key is required for OpenAI embedder")
 
+
+    # sub2api downstream embedding-server patch
+    embedding_server_socket = __import__("os").environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET")
+    if (
+        embedding_server_socket
+        and __import__("os").environ.get("HEADROOM_EMBEDDING_SERVER_CHILD") != "1"
+        and config.embedder_backend in (EmbedderBackend.LOCAL, EmbedderBackend.ONNX)
+    ):
+        key = ("embedding_server", embedding_server_socket)
+        with _EMBEDDER_CACHE_LOCK:
+            cached = _EMBEDDER_CACHE.get(key)
+            if cached is not None:
+                return cached
+            from headroom.memory.adapters.watchdog import SocketEmbedderClient
+
+            embedder = SocketEmbedderClient(
+                embedding_server_socket,
+                model_name=config.embedder_model,
+            )
+            _EMBEDDER_CACHE[key] = embedder
+            return embedder
+
     key = (
         config.embedder_backend.value
         if hasattr(config.embedder_backend, "value")

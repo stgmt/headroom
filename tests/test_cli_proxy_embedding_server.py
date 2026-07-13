@@ -1,17 +1,17 @@
-"""Regression test for `proxy --embedding-server` startup fallback.
-
-The optional embedding-server sidecar module
-(`headroom.memory.adapters.watchdog`) is not present on main, yet the
-`--embedding-server` flag advertises a graceful fallback to the per-worker
-embedder. A misplaced import made the flag raise ``ModuleNotFoundError`` at
-startup and crash the proxy instead of falling back.
-"""
+"""Regression tests for `proxy --embedding-server` startup behavior."""
 
 import sys
 
 from click.testing import CliRunner
 
 from headroom.cli import main
+
+
+def test_embedding_server_sidecar_module_is_packaged():
+    from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog, SocketEmbedderClient
+
+    assert EmbeddingServerWatchdog is not None
+    assert SocketEmbedderClient.DEFAULT_DIMENSION == 384
 
 
 def test_embedding_server_missing_sidecar_falls_back(monkeypatch):

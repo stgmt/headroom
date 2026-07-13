@@ -65,6 +65,8 @@ class StreamingMixin:
 
     _mid_turn_queues: dict[str, asyncio.Queue] = {}
     _active_streams: set[str] = set()
+    # sub2api downstream Claude Code active-stream refcount patch
+    _active_stream_counts: dict[str, int] = {}
 
     @staticmethod
     def _get_session_key(body: dict, session_header: str | None = None) -> str:
@@ -95,10 +97,59 @@ class StreamingMixin:
         self._mid_turn_queues[session_key].put_nowait(body)
         return {"status": 202, "event": "headroom_queued"}
 
+    # sub2api downstream Claude Code overlap wait patch
+    def _mark_mid_turn_stream_active(self, session_key: str) -> None:
+        self._active_stream_counts[session_key] = (
+            self._active_stream_counts.get(session_key, 0) + 1
+        )
+        self._active_streams.add(session_key)
+
+    async def _wait_for_mid_turn_stream(self, session_key: str, request_id: str) -> float:
+        import os
+
+        raw_wait_ms = os.environ.get("HEADROOM_MID_TURN_STREAM_WAIT_MS", "600000")
+        try:
+            wait_ms = max(0, int(raw_wait_ms))
+        except (TypeError, ValueError):
+            wait_ms = 600000
+        if wait_ms <= 0:
+            return 0.0
+
+        start = time.monotonic()
+        deadline = start + (wait_ms / 1000.0)
+        logged = False
+        while session_key in self._active_streams and time.monotonic() < deadline:
+            if not logged:
+                logger.warning(
+                    "event=mid_turn_overlap_wait request_id=%s session_key=%s wait_ms=%s",
+                    request_id,
+                    session_key,
+                    wait_ms,
+                )
+                logged = True
+            await asyncio.sleep(0.05)
+
+        waited_ms = (time.monotonic() - start) * 1000.0
+        if logged:
+            logger.warning(
+                "event=mid_turn_overlap_wait_done request_id=%s session_key=%s "
+                "waited_ms=%.2f still_active=%s",
+                request_id,
+                session_key,
+                waited_ms,
+                session_key in self._active_streams,
+            )
+        return waited_ms
+
     def _cleanup_mid_turn_stream(
         self, session_key: str, *, drain_pending_messages: bool = False
     ) -> list[dict]:
         """Clear active mid-turn state, optionally returning queued messages."""
+        count = self._active_stream_counts.get(session_key, 0)
+        if count > 1:
+            self._active_stream_counts[session_key] = count - 1
+            return []
+        self._active_stream_counts.pop(session_key, None)
         self._active_streams.discard(session_key)
         queue = self._mid_turn_queues.pop(session_key, None)
         if not drain_pending_messages or queue is None or queue.empty():
@@ -973,7 +1024,7 @@ class StreamingMixin:
         4. Streams the final response to the client
         """
         session_key = session_key or self._get_session_key(body)
-        self._active_streams.add(session_key)
+        self._mark_mid_turn_stream_active(session_key)
 
         # Guard everything up to the generator's own try/finally (which owns
         # cleanup once streaming starts): any exception here — including
