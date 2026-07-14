@@ -13,6 +13,7 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 - Upstream: `https://github.com/headroomlabs-ai/headroom`
 - Gotchas ledger: `docs/stgmt-gotchas.md`
 - Maintenance guide: `docs/stgmt-maintenance.md`
+- GPU research and deployment record: `docs/stgmt-gpu-kompress.md`; portable skill copy: `references/gpu-kompress.md`
 - sub2api profile mirror: `stgmt/sub2api`, `deploy/claude-code-codex-headroom`, and `backend/docs/skills/sub2api-claude-code-codex`
 - Local runtime profile on this machine: `C:\Users\stigm\Documents\Codex\2026-07-07\new-chat\work\sub2api-runtime`
 
@@ -60,3 +61,5 @@ Expected runtime marker:
 - If a Headroom fix affects the local Claude Code stack, mirror the install/verify guidance into the `sub2api-claude-code-codex` skill.
 - If a sub2api compose/profile fix affects Headroom behavior, mirror the invariant here too, sync the local Codex skill, and push both repos when both changed.
 - Keep `stgmt/headroom` and `stgmt/sub2api` commits linked in final reports when both repos change.
+- Preserve field research as repo-owned docs, not only chat history or machine-local skills. Record primary sources, exact runtime proof, benchmark method, known limits, and the integration issue that owns remaining work.
+- Keep `skills/headroom-sub2api-maintainer/references/gpu-kompress.md` byte-identical to `docs/stgmt-gpu-kompress.md` whenever the field report changes.

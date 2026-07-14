@@ -43,6 +43,9 @@ Expected runtime marker:
 
 CUDA profile proof:
 
+The source-level rationale, benchmark method, autostart failure, and ownership
+boundary are recorded in `docs/stgmt-gpu-kompress.md`.
+
 ```powershell
 wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api python -c "import torch; from headroom.transforms.kompress_compressor import KompressCompressor; print(torch.cuda.is_available(), torch.cuda.get_device_name(0), KompressCompressor().preload(allow_download=False))"
 wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api benchmark-headroom-kompress --require-cuda
