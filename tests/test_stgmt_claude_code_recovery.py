@@ -31,6 +31,54 @@ def test_claude_code_session_key_uses_agent_id() -> None:
     assert helper(_Request({})) is None
 
 
+def _compact_prompt() -> str:
+    return "\n".join(
+        (
+            "Your task is to create a detailed summary of the conversation so far.",
+            "Wrap the analysis in <analysis> tags and the result in <summary> tags.",
+            "Include All user messages, Pending Tasks, Current Work, and Context for Continuing Work.",
+        )
+    )
+
+
+def test_claude_code_compact_prompt_is_detected_and_restored() -> None:
+    body = {
+        "system": "normal Claude Code system prompt",
+        "messages": [
+            {"role": "user", "content": "normal request"},
+            {"role": "assistant", "content": "normal response"},
+            {"role": "user", "content": [{"type": "text", "text": _compact_prompt()}]},
+        ],
+    }
+
+    detected, index = anthropic._is_claude_code_compact_request(body)
+    assert detected is True
+    assert index == 2
+
+    compressed = [
+        body["messages"][0],
+        body["messages"][1],
+        {"role": "user", "content": "[kompress changed the compact prompt]"},
+    ]
+    restored = anthropic._restore_claude_code_compact_message(
+        compressed, index, body["messages"][index]
+    )
+    assert restored[2] == body["messages"][2]
+    assert compressed[2]["content"] == "[kompress changed the compact prompt]"
+
+
+def test_post_compact_summary_is_not_misclassified() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Summary: Pending Tasks, Current Work, Context for Continuing Work.",
+            }
+        ]
+    }
+    assert anthropic._is_claude_code_compact_request(body) == (False, None)
+
+
 def test_anthropic_mid_turn_path_no_longer_returns_private_202() -> None:
     source = inspect.getsource(anthropic._sub2api_original_handle_anthropic_messages)
 

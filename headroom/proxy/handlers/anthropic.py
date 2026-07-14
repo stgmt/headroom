@@ -52,6 +52,85 @@ def _headroom_session_header_from_request(request: Any) -> str | None:
     return f"claude-code:{claude_session}:{claude_agent}"
 
 
+_CLAUDE_CODE_COMPACT_ANCHORS = (
+    "your task is to create a detailed summary",
+    "create a detailed summary",
+    "detailed summary of the conversation",
+    "summary of the conversation so far",
+)
+_CLAUDE_CODE_COMPACT_MARKERS = (
+    "<analysis>",
+    "<summary>",
+    "all user messages",
+    "pending tasks",
+    "current work",
+    "work completed",
+    "context for continuing work",
+    "optional next step",
+)
+
+
+def _anthropic_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        text = content.get("text")
+        return text if isinstance(text, str) else ""
+    if isinstance(content, list):
+        return "\n\n".join(
+            part for item in content if (part := _anthropic_content_text(item))
+        )
+    return ""
+
+
+def _looks_like_claude_code_compact_prompt(content: Any) -> bool:
+    text = _anthropic_content_text(content).strip().lower()
+    if not text or not any(anchor in text for anchor in _CLAUDE_CODE_COMPACT_ANCHORS):
+        return False
+    return sum(marker in text for marker in _CLAUDE_CODE_COMPACT_MARKERS) >= 3
+
+
+def _claude_code_compact_message_index(body: dict[str, Any]) -> int | None:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and _looks_like_claude_code_compact_prompt(
+            message.get("content")
+        ):
+            return index
+    return None
+
+
+def _is_claude_code_compact_request(body: dict[str, Any]) -> tuple[bool, int | None]:
+    message_index = _claude_code_compact_message_index(body)
+    return (
+        message_index is not None or _looks_like_claude_code_compact_prompt(body.get("system")),
+        message_index,
+    )
+
+
+def _restore_claude_code_compact_message(
+    optimized_messages: list[dict[str, Any]],
+    original_index: int,
+    original_message: dict[str, Any],
+) -> list[dict[str, Any]]:
+    restored = copy.deepcopy(optimized_messages)
+    if (
+        0 <= original_index < len(restored)
+        and isinstance(restored[original_index], dict)
+        and restored[original_index].get("role") == original_message.get("role")
+    ):
+        restored[original_index] = copy.deepcopy(original_message)
+        return restored
+
+    # Consecutive Anthropic messages with the same role are combined upstream.
+    # Appending is the safe fallback when a pipeline extension changed indices.
+    restored.append(copy.deepcopy(original_message))
+    return restored
+
+
 def _strip_streaming_only_content_fields(messages: Any) -> None:
     """Remove streaming-only ``index`` keys from request content blocks, in place.
 
@@ -721,6 +800,14 @@ class AnthropicHandlerMixin:
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])
+            claude_compact_request, claude_compact_message_index = (
+                _is_claude_code_compact_request(body)
+            )
+            claude_compact_message = (
+                copy.deepcopy(messages[claude_compact_message_index])
+                if claude_compact_message_index is not None
+                else None
+            )
             # Strip streaming-only "index" keys from request content blocks BEFORE any
             # prefix-cache tracking or compression. The proxy's streaming reconstruction
             # tags assistant blocks with an "index" for SSE re-emission; clients (e.g.
@@ -787,6 +874,9 @@ class AnthropicHandlerMixin:
             # user turn later in this handler to preserve Anthropic prefix caching.
             # Extract headers and tags
             headers = dict(request.headers.items())
+            if claude_compact_request:
+                headers["x-sub2api-claude-compact"] = "1"
+                logger.info("[%s] Claude Code compact request detected", request_id)
             headers.pop("host", None)
             headers.pop("content-length", None)
             # read_request_json_with_bytes already content-decoded the inbound
@@ -2265,12 +2355,23 @@ class AnthropicHandlerMixin:
                     tools = _req_ctx.tools
                     body["tools"] = tools
 
+            if claude_compact_message is not None and claude_compact_message_index is not None:
+                optimized_messages = _restore_claude_code_compact_message(
+                    optimized_messages,
+                    claude_compact_message_index,
+                    claude_compact_message,
+                )
+                body["messages"] = optimized_messages
+                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                tokens_saved = max(0, original_tokens - optimized_tokens)
+                transforms_applied.append("headroom:claude_code_compact_prompt_preserved")
+
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
             # steering appended to the system-prompt tail + effort routing on
             # mechanical tool_result continuations. Runs after every other
             # body mutation so the turn classifier sees the final messages,
             # and respects the same bypass header as compression.
-            if not _bypass:
+            if not _bypass and not claude_compact_request:
                 from headroom.proxy.output_savings import (
                     assign_arm,
                     conversation_key_from_body,
