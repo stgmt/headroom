@@ -94,6 +94,41 @@ Measured on RTX 4070 SUPER, identical 8 x 1400-word fixture:
 - Speedup: 46.4x; both retained 664/664 sentinels and produced the same 0.215
   compression ratio.
 
+## 2026-07-14: Headroom transforms can hide native Claude Code compact requests
+
+Problem:
+A native Claude Code `/compact` uses the current session model in the UI and
+sends its compact instruction as the final user message. Headroom detected that
+request as an ordinary `new_user_ask`, compressed the final instruction, and
+applied output shaping. sub2api therefore could not recognize the compact and
+routed the request to Sol instead of the configured Spark compact model.
+
+Fix:
+- Detect the native compact anchors before any Headroom transform.
+- Preserve and restore the exact final compact message after compression hooks.
+- Add `x-sub2api-claude-compact: 1` to the downstream request.
+- Skip Headroom output shaping for compact requests.
+- Keep sub2api responsible for `Spark -> Luna` fallback. A transcript that
+  contains image blocks makes Spark return HTTP 400 because it has no image
+  input support; that exact compact failure must switch to Luna.
+
+Files:
+- `headroom/proxy/handlers/anthropic.py`
+- `tests/test_stgmt_claude_code_recovery.py`
+- paired sub2api handler: `backend/internal/service/openai_gateway_messages.go`
+
+Required proof:
+- Installed Headroom source contains `_is_claude_code_compact_request`,
+  `x-sub2api-claude-compact`, and
+  `headroom:claude_code_compact_prompt_preserved`.
+- `proxy-requests.jsonl` records the preserved-prompt transform for a real
+  forked Claude Code `/compact`.
+- sub2api logs show `compact_model_unavailable_fallback` when Spark rejects
+  image input, and the final successful `usage_logs` row uses
+  `upstream_model=gpt-5.6-luna`.
+- Live proof on 2026-07-14: a 222.5k-context fork compacted successfully in
+  129.1 seconds; final Luna row used 142,766 input and 4,258 output tokens.
+
 ## Sync Rule
 
 When this fork changes a behavior used by the sub2api Docker profile, update the sub2api stack too:

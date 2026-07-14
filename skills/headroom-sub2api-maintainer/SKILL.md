@@ -1,6 +1,6 @@
 ---
 name: headroom-sub2api-maintainer
-description: Maintain the stgmt/headroom fork for Claude Code through Headroom + sub2api + Codex/OpenAI subscription routing. Use for Headroom fork syncs, Claude Code stream hangs, Headroom private 202 queue responses, handler watchdog retry, embedding-server sidecar, CUDA/PyTorch Kompress acceleration, WSL/Docker localhost relay issues, and keeping gotchas/tests/docs aligned with the sub2api Docker profile.
+description: Maintain the stgmt/headroom fork for Claude Code through Headroom + sub2api + Codex/OpenAI subscription routing. Use for Headroom fork syncs, native compact routing, Claude Code stream hangs, Headroom private 202 queue responses, handler watchdog retry, embedding-server sidecar, CUDA/PyTorch Kompress acceleration, WSL/Docker localhost relay issues, and keeping gotchas/tests/docs aligned with the sub2api Docker profile.
 ---
 
 # Headroom sub2api Maintainer
@@ -20,6 +20,7 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 ## Critical Invariants
 
 - Claude Code must not receive Headroom's private HTTP 202 `headroom_queued` response for streaming `/v1/messages`.
+- Native Claude Code compact requests must retain their exact final compact message after Headroom transforms, must carry `x-sub2api-claude-compact: 1` downstream, and must skip output shaping. Otherwise sub2api sees an ordinary Sol request and compact routing silently stays on Sol.
 - Claude Code stream keys must include both `x-claude-code-session-id` and `x-claude-code-agent-id` unless an explicit `x-headroom-session-id` is provided.
 - Handler watchdog timeout must cancel the primary handler and retry once through Headroom bypass/passthrough before any 504 leaves the proxy.
 - `--embedding-server` must use `headroom.memory.adapters.watchdog.SocketEmbedderClient` when `HEADROOM_EMBEDDING_SERVER_SOCKET` is set; silent per-worker fallback is a regression unless the sidecar import/start is deliberately forced to fail by a test.
@@ -54,6 +55,8 @@ wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api benchmark-headroom-kompr
 
 Expected runtime marker:
 `WATCHDOG_RETRY_OK attempts=2 response=WATCHDOG_RETRY_RESPONSE`
+
+For native compact routing, the installed handler must contain `_is_claude_code_compact_request`, `x-sub2api-claude-compact`, and `headroom:claude_code_compact_prompt_preserved`. A real forked Claude Code `/compact`, not only a synthetic probe, must produce that transform marker in `proxy-requests.jsonl` and a Spark/Luna compact route in sub2api `usage_logs`.
 
 ## Update Discipline
 
