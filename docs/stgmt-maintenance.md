@@ -16,6 +16,7 @@ Keep the Claude Code + Headroom + sub2api/Codex subscription path reliable while
 - Active-stream refcounts.
 - Claude Code handler watchdog with one bypass/passthrough retry before 504.
 - Embedding server sidecar module and socket embedder factory path.
+- Optional CUDA PyTorch Kompress runtime through the sub2api GPU image stage and compose overlay.
 
 ## Verification Commands
 
@@ -40,6 +41,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File backend/docs/skills/sub2api-
 Expected runtime marker:
 `WATCHDOG_RETRY_OK attempts=2 response=WATCHDOG_RETRY_RESPONSE`
 
+CUDA profile proof:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api python -c "import torch; from headroom.transforms.kompress_compressor import KompressCompressor; print(torch.cuda.is_available(), torch.cuda.get_device_name(0), KompressCompressor().preload(allow_download=False))"
+wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api benchmark-headroom-kompress --require-cuda
+```
+
+The 2026-07-14 RTX 4070 SUPER A/B used the same 8 x 1400-word payload and
+retained all 664 sentinels. CPU ONNX median was 24.1358 seconds; CUDA PyTorch
+median was 0.5202 seconds, a 46.4x speedup for that batched fixture. Do not
+generalize that multiplier without rerunning the fixture on the target GPU.
+
 ## Upstream Sync Checklist
 
 1. Fetch upstream `headroomlabs-ai/headroom`.
@@ -55,3 +68,4 @@ Expected runtime marker:
 - A TCP-open localhost port is not proof that Windows can reach the proxy HTTP app.
 - The Docker runtime is the source of truth for whether a patch is active.
 - Keep gotchas in this repo and mirror operational instructions into the sub2api skill when they affect installation or verification.
+- GPU enablement belongs to the sub2api Docker profile: Headroom already implements the PyTorch CUDA batch path, while the image/compose must provide CUDA Torch and GPU devices.

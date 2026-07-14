@@ -64,6 +64,36 @@ Operational rule:
 Observed working route:
 - `http://172.30.206.176:8787` on 2026-07-13.
 
+## 2026-07-14: Docker GPU passthrough does not switch Kompress off CPU ONNX
+
+Problem:
+The host and WSL can see an NVIDIA GPU, and a container can have `gpus: all`,
+while Headroom still runs Kompress on CPU. The standard image installs
+`onnxruntime` only, and the ONNX backend explicitly selects
+`CPUExecutionProvider`. It does not contain CUDA PyTorch.
+
+Fix in the `stgmt/sub2api` profile:
+- Keep the default CPU image stage for portable installs.
+- Add a GPU image stage with pinned CUDA PyTorch.
+- Apply `docker-compose.gpu.yml`, which requests all GPUs and sets
+  `HEADROOM_KOMPRESS_BACKEND=pytorch`.
+- Persist `HEADROOM_ACCELERATOR=cuda` so the single autostart owner reapplies
+  the GPU overlay after reboot.
+
+Required proof:
+- Docker inspect shows non-empty GPU `DeviceRequests`.
+- `torch.cuda.is_available()` is true and reports the expected GPU.
+- `KompressCompressor().preload(allow_download=False)` returns `pytorch` and
+  the loaded model device is `cuda`.
+- `benchmark-headroom-kompress --require-cuda` succeeds with full sentinel
+  retention.
+
+Measured on RTX 4070 SUPER, identical 8 x 1400-word fixture:
+- CPU ONNX: 24.1358 seconds median, 464.04 input tokens/s.
+- CUDA PyTorch: 0.5202 seconds median, 21,530.32 input tokens/s.
+- Speedup: 46.4x; both retained 664/664 sentinels and produced the same 0.215
+  compression ratio.
+
 ## Sync Rule
 
 When this fork changes a behavior used by the sub2api Docker profile, update the sub2api stack too:

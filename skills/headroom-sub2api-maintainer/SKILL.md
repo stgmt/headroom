@@ -1,6 +1,6 @@
 ---
 name: headroom-sub2api-maintainer
-description: Maintain the stgmt/headroom fork for Claude Code through Headroom + sub2api + Codex/OpenAI subscription routing. Use for Headroom fork syncs, Claude Code stream hangs, Headroom private 202 queue responses, handler watchdog retry, embedding-server sidecar, WSL/Docker localhost relay issues, and keeping gotchas/tests/docs aligned with the sub2api Docker profile.
+description: Maintain the stgmt/headroom fork for Claude Code through Headroom + sub2api + Codex/OpenAI subscription routing. Use for Headroom fork syncs, Claude Code stream hangs, Headroom private 202 queue responses, handler watchdog retry, embedding-server sidecar, CUDA/PyTorch Kompress acceleration, WSL/Docker localhost relay issues, and keeping gotchas/tests/docs aligned with the sub2api Docker profile.
 ---
 
 # Headroom sub2api Maintainer
@@ -29,6 +29,7 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 - Use one autostart owner for the whole compose stack: `Sub2API Codex Proxy Stack Autostart`. Remove stale separate host `headroom-proxy` tasks or Startup-folder launchers.
 - On Docker-in-WSL, Windows `127.0.0.1:8787` can hang even when Docker health is green. If WSL/Docker health works but Windows localhost hangs, publish Headroom on `0.0.0.0`, set Claude Code `ANTHROPIC_BASE_URL` to `http://<wsl-eth0-ip>:8787`, and keep direct sub2api `:18081` only as a diagnostic/admin bypass.
 - Runtime proof beats source proof. A committed patch is not active until the running `headroom-sub2api` container proves it.
+- Host `nvidia-smi` or Docker `gpus: all` alone does not make Kompress use CUDA. The image needs CUDA PyTorch, compose must set `HEADROOM_KOMPRESS_BACKEND=pytorch`, Docker inspect must show GPU `DeviceRequests`, and a live preload must return backend `pytorch` on device `cuda`. Keep CPU as the portable fallback.
 
 ## Required Checks
 
@@ -46,6 +47,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File backend/docs/skills/sub2api-
 wsl.exe -d Ubuntu-24.04 -- bash -lc 'docker ps --filter label=com.docker.compose.project=sub2api-codex --format "{{.Names}}|{{.Image}}|{{.Status}}"'
 wsl.exe -d Ubuntu-24.04 -- bash -lc 'docker inspect headroom-sub2api sub2api-codex --format "{{.Name}} source={{index .Config.Labels \"org.opencontainers.image.source\"}} revision={{index .Config.Labels \"org.opencontainers.image.revision\"}} health={{if .State.Health}}{{.State.Health.Status}}{{end}}"'
 wsl.exe -d Ubuntu-24.04 -- bash -lc 'docker inspect headroom-sub2api sub2api-codex sub2api-codex-postgres sub2api-codex-redis --format "{{.Name}} {{range .Mounts}}{{.Destination}}={{.Type}} {{end}}"'
+wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api python -c "import torch; from headroom.transforms.kompress_compressor import KompressCompressor; print(torch.cuda.is_available(), torch.cuda.get_device_name(0), KompressCompressor().preload(allow_download=False))"
+wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api benchmark-headroom-kompress --require-cuda
 ```
 
 Expected runtime marker:
