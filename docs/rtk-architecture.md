@@ -96,6 +96,36 @@ Every `headroom wrap <agent>` subcommand:
 
 See `headroom/cli/wrap/` for the per-agent shims.
 
+## Split-host Claude Code deployment
+
+The `stgmt/sub2api` Windows + WSL + Docker profile does not launch Claude Code
+through `headroom wrap`. Claude Code runs on Windows, Headroom runs in Docker,
+and shell commands execute on the Windows side before their output reaches the
+proxy. In this topology, RTK installed only in the Headroom image is inert for
+Claude Code Bash calls.
+
+The supported split-host contract is:
+
+1. Install the same pinned RTK release on Windows and in the selected WSL
+   distro. The WSL binary parses the Claude hook payload; the rewritten command
+   resolves the Windows RTK binary in Claude Code's Git Bash process.
+2. Register exactly one global `PreToolUse(Bash)` hook through WSL. Prefix it
+   with `MSYS2_ARG_CONV_EXCL='*'`; otherwise Git Bash rewrites
+   `/home/.../rtk` to `C:/Program Files/Git/home/.../rtk`, the hook fails, and
+   Claude Code silently executes the original command.
+3. Exclude exact-source and raw-wire commands (`cat`, `git diff`, `git show`,
+   `curl`) from automatic rewriting. `RTK_DISABLED=1` is the one-off bypass.
+4. Bind the host RTK state directory into Headroom at
+   `/root/.local/share/rtk`. This does not move RTK into the proxy hot path; it
+   lets Headroom's perf/dashboard reader observe the command-side history.
+
+Verification must include a real fresh Claude Code Bash tool call. A direct
+`rtk` invocation in the container proves only that the binary works. The live
+contract is satisfied when Claude debug logs show the hook modified the tool
+input, host `history.db` gains the rewritten command, host/container
+`rtk gain --format json` totals match, and `headroom perf --format json` reports
+nonzero `cli_filtering` RTK savings.
+
 ## Re-litigation policy
 
 A change to this architecture should:

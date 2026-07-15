@@ -129,6 +129,50 @@ Required proof:
 - Live proof on 2026-07-14: a 222.5k-context fork compacted successfully in
   129.1 seconds; final Luna row used 142,766 input and 4,258 output tokens.
 
+## 2026-07-15: Container-only RTK does not optimize host Claude Code
+
+Problem:
+The Headroom image contained RTK and a controlled container probe showed 97.55%
+output reduction, but normal Claude Code traffic still reported zero automatic
+RTK commands/savings. Claude Code executes Bash on Windows before Headroom sees
+the tool result, so the container binary was outside the execution path.
+
+First failed fix:
+A global Claude `PreToolUse(Bash)` hook called the WSL RTK binary and passed a
+direct PowerShell-to-WSL synthetic probe. In a real Claude Code process the hook
+still did nothing. Claude's debug log proved that Git Bash/MSYS changed
+`/home/devcontainers/.local/bin/rtk` into
+`C:/Program Files/Git/home/devcontainers/.local/bin/rtk`; the hook errored and
+Claude continued with the original command.
+
+Fix in the paired `stgmt/sub2api` profile:
+- Install pinned RTK 0.42.4 on Windows and WSL.
+- Prefix the WSL hook command with `MSYS2_ARG_CONV_EXCL='*'`.
+- Probe the hook through Git Bash, not directly from PowerShell.
+- Preserve `cat`, `git diff`, `git show`, and `curl` accuracy exclusions.
+- Bind `%LOCALAPPDATA%\rtk` into Headroom at `/root/.local/share/rtk` so the
+  dashboard reads the same persistent command history as the host.
+
+Required proof:
+- Claude debug contains `Hook PreToolUse:Bash (PreToolUse) success` and
+  `modified tool input keys: [command, description]`.
+- A real Claude Bash `git log -1 --oneline` creates a host history row with
+  `rtk_cmd=rtk git log -1 --oneline`.
+- An isolated fresh Claude `eslint tools/tui-test-runner/dispatch.ts` probe
+  created history row 1082 with `rtk_cmd=rtk lint eslint ...`, reduced output
+  from 61 to 6 tokens, and saved 90.16% without a manual `rtk` command.
+- Host and container `rtk gain --format json` totals match.
+- Live proof after wiring: 1,045 commands, 1,987,904 tokens saved, 72.8% average
+  savings; `headroom perf --format json` reported the same values under
+  `cli_filtering`. The earlier 97.55% remains a controlled capability probe,
+  not the lifetime live savings rate.
+
+Owned files:
+- `stgmt/sub2api` `scripts/install-claude-rtk.ps1`
+- `stgmt/sub2api` `scripts/verify-claude-code-sub2api.ps1`
+- `stgmt/sub2api` `deploy/claude-code-codex-headroom/docker-compose.yml`
+- `docs/rtk-architecture.md`
+
 ## Sync Rule
 
 When this fork changes a behavior used by the sub2api Docker profile, update the sub2api stack too:

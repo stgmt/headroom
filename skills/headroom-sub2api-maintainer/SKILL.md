@@ -1,6 +1,6 @@
 ---
 name: headroom-sub2api-maintainer
-description: Maintain the stgmt/headroom fork for Claude Code through Headroom + sub2api + Codex/OpenAI subscription routing. Use for Headroom fork syncs, native compact routing, Claude Code stream hangs, Headroom private 202 queue responses, handler watchdog retry, embedding-server sidecar, CUDA/PyTorch Kompress acceleration, WSL/Docker localhost relay issues, and keeping gotchas/tests/docs aligned with the sub2api Docker profile.
+description: Maintain the stgmt/headroom fork for Claude Code through Headroom + sub2api + Codex/OpenAI subscription routing. Use for Headroom fork syncs, native compact routing, Claude Code stream hangs, Headroom private 202 queue responses, handler watchdog retry, embedding-server sidecar, CUDA/PyTorch Kompress acceleration, split-host RTK wiring and metrics, WSL/Docker localhost relay issues, and keeping gotchas/tests/docs aligned with the sub2api Docker profile.
 ---
 
 # Headroom sub2api Maintainer
@@ -32,6 +32,7 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 - On Docker-in-WSL, Windows `127.0.0.1:8787` can hang even when Docker health is green. If WSL/Docker health works but Windows localhost hangs, publish Headroom on `0.0.0.0`, set Claude Code `ANTHROPIC_BASE_URL` to `http://<wsl-eth0-ip>:8787`, and keep direct sub2api `:18081` only as a diagnostic/admin bypass.
 - Runtime proof beats source proof. A committed patch is not active until the running `headroom-sub2api` container proves it.
 - Host `nvidia-smi` or Docker `gpus: all` alone does not make Kompress use CUDA. The image needs CUDA PyTorch, compose must set `HEADROOM_KOMPRESS_BACKEND=pytorch`, Docker inspect must show GPU `DeviceRequests`, and a live preload must return backend `pytorch` on device `cuda`. Keep CPU as the portable fallback.
+- RTK remains command-side. In the Windows Claude Code + WSL Docker topology, container-only RTK cannot rewrite host Bash commands. Require pinned Windows plus WSL RTK, exactly one `PreToolUse(Bash)` WSL bridge with `MSYS2_ARG_CONV_EXCL='*'`, safety exclusions for `cat`/`git diff`/`git show`/`curl`, and a host-state bind at `/root/.local/share/rtk`. This mount is for observability, not proxy-side mutation.
 
 ## Required Checks
 
@@ -51,7 +52,15 @@ wsl.exe -d Ubuntu-24.04 -- bash -lc 'docker inspect headroom-sub2api sub2api-cod
 wsl.exe -d Ubuntu-24.04 -- bash -lc 'docker inspect headroom-sub2api sub2api-codex sub2api-codex-postgres sub2api-codex-redis --format "{{.Name}} {{range .Mounts}}{{.Destination}}={{.Type}} {{end}}"'
 wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api python -c "import torch; from headroom.transforms.kompress_compressor import KompressCompressor; print(torch.cuda.is_available(), torch.cuda.get_device_name(0), KompressCompressor().preload(allow_download=False))"
 wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api benchmark-headroom-kompress --require-cuda
+rtk gain --format json
+wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api rtk gain --format json
+wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api headroom perf --format json
 ```
+
+For RTK, require matching host/container totals plus a real fresh Claude Code
+Bash call whose debug log says `Hook PreToolUse:Bash ... success` and
+`modified tool input keys`. A synthetic PowerShell-to-WSL hook probe does not
+exercise Git Bash path conversion and is insufficient.
 
 Expected runtime marker:
 `WATCHDOG_RETRY_OK attempts=2 response=WATCHDOG_RETRY_RESPONSE`
