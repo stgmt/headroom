@@ -1,6 +1,6 @@
 ---
 name: headroom-sub2api-maintainer
-description: Maintain the stgmt/headroom fork for Claude Code through Headroom + sub2api + Codex/OpenAI subscription routing. Use for Headroom fork syncs, native compact routing, Claude Code stream hangs, Headroom private 202 queue responses, handler watchdog retry, embedding-server sidecar, CUDA/PyTorch Kompress acceleration, split-host RTK wiring and metrics, WSL/Docker localhost relay issues, and keeping gotchas/tests/docs aligned with the sub2api Docker profile.
+description: Maintain the stgmt/headroom fork for Claude Code through Headroom + sub2api + Codex/OpenAI subscription routing. Use for Headroom fork syncs, native compact routing, Claude Code stream hangs, handler watchdog retry, embedding-server, CUDA/PyTorch Kompress, Windows/WSL or native Ubuntu/Hyper-V RTK wiring, split-host metrics, WSL/Docker routing, and keeping gotchas/tests/docs aligned with the sub2api Docker profile.
 ---
 
 # Headroom sub2api Maintainer
@@ -15,6 +15,7 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 - Maintenance guide: `docs/stgmt-maintenance.md`
 - GPU research and deployment record: `docs/stgmt-gpu-kompress.md`; portable skill copy: `references/gpu-kompress.md`
 - sub2api profile mirror: `stgmt/sub2api`, `deploy/claude-code-codex-headroom`, and `backend/docs/skills/sub2api-claude-code-codex`
+- RTK installers owned by `stgmt/sub2api`: `scripts/install-claude-rtk.ps1` for Windows plus WSL and `scripts/install-claude-rtk.sh` for native Linux Claude hosts
 - Local runtime profile on this machine: `C:\Users\stigm\Documents\Codex\2026-07-07\new-chat\work\sub2api-runtime`
 
 ## Critical Invariants
@@ -32,7 +33,8 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 - On Docker-in-WSL, Windows `127.0.0.1:8787` can hang even when Docker health is green. If WSL/Docker health works but Windows localhost hangs, publish Headroom on `0.0.0.0`, set Claude Code `ANTHROPIC_BASE_URL` to `http://<wsl-eth0-ip>:8787`, and keep direct sub2api `:18081` only as a diagnostic/admin bypass.
 - Runtime proof beats source proof. A committed patch is not active until the running `headroom-sub2api` container proves it.
 - Host `nvidia-smi` or Docker `gpus: all` alone does not make Kompress use CUDA. The image needs CUDA PyTorch, compose must set `HEADROOM_KOMPRESS_BACKEND=pytorch`, Docker inspect must show GPU `DeviceRequests`, and a live preload must return backend `pytorch` on device `cuda`. Keep CPU as the portable fallback.
-- RTK remains command-side. In the Windows Claude Code + WSL Docker topology, container-only RTK cannot rewrite host Bash commands. Require pinned Windows plus WSL RTK, exactly one `PreToolUse(Bash)` WSL bridge with `MSYS2_ARG_CONV_EXCL='*'`, safety exclusions for `cat`/`git diff`/`git show`/`curl`, and a host-state bind at `/root/.local/share/rtk`. This mount is for observability, not proxy-side mutation.
+- RTK remains command-side and must be installed in the same OS/user account that executes Claude Code Bash. Container-only RTK cannot rewrite host commands. For Windows Claude Code plus WSL Docker, use the paired `install-claude-rtk.ps1`, pinned Windows plus WSL RTK, and one `PreToolUse(Bash)` bridge with `MSYS2_ARG_CONV_EXCL='*'`. For Claude Code installed on a native Ubuntu host or Hyper-V VM outside its devcontainers, use `install-claude-rtk.sh` as that Claude user and one absolute native-Linux hook. Never install RTK only in a devcontainer when Claude runs on the outer Ubuntu host. Both topologies require RTK 0.42.4 and exclusions for `cat`/`git diff`/`git show`/`curl`.
+- Bind host RTK state at `/root/.local/share/rtk` only when Headroom can access that same filesystem. In split-host VM -> remote Headroom layouts, prove VM-side savings from the VM's `rtk gain`; do not claim Headroom dashboard parity unless that history is explicitly shared.
 
 ## Required Checks
 
@@ -57,10 +59,22 @@ wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api rtk gain --format json
 wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api headroom perf --format json
 ```
 
-For RTK, require matching host/container totals plus a real fresh Claude Code
-Bash call whose debug log says `Hook PreToolUse:Bash ... success` and
-`modified tool input keys`. A synthetic PowerShell-to-WSL hook probe does not
-exercise Git Bash path conversion and is insufficient.
+Before any RTK claim, locate the actual Claude binary and choose the installer
+for that host, not for the Docker location:
+
+```text
+Windows Claude + WSL Docker -> stgmt/sub2api .../scripts/install-claude-rtk.ps1
+Native Ubuntu/Hyper-V Claude -> stgmt/sub2api .../scripts/install-claude-rtk.sh
+Claude inside devcontainer   -> run install-claude-rtk.sh inside that container
+```
+
+For RTK, require a real fresh Claude Code Bash call whose debug log says
+`Hook PreToolUse:Bash ... success` and `modified tool input keys`, plus an
+increment in that Claude host's `rtk gain --format json`. Require matching
+host/container totals only when Headroom mounts the same RTK state. A synthetic
+hook probe proves rewrite syntax but does not prove automatic Claude use. On
+Windows, a direct PowerShell-to-WSL probe also misses Git Bash path conversion
+and is insufficient.
 
 Expected runtime marker:
 `WATCHDOG_RETRY_OK attempts=2 response=WATCHDOG_RETRY_RESPONSE`
@@ -72,6 +86,7 @@ For native compact routing, the installed handler must contain `_is_claude_code_
 - Every new production gotcha gets an entry in `docs/stgmt-gotchas.md` with date, symptom, mechanism, fix, files, and proof.
 - If a Headroom fix affects the local Claude Code stack, mirror the install/verify guidance into the `sub2api-claude-code-codex` skill.
 - If a sub2api compose/profile fix affects Headroom behavior, mirror the invariant here too, sync the local Codex skill, and push both repos when both changed.
+- When the Claude host topology changes, rerun the matching RTK installer and live proof. Do not infer host wiring from RTK being present in the Headroom image or a devcontainer.
 - Keep `stgmt/headroom` and `stgmt/sub2api` commits linked in final reports when both repos change.
 - Preserve field research as repo-owned docs, not only chat history or machine-local skills. Record primary sources, exact runtime proof, benchmark method, known limits, and the integration issue that owns remaining work.
 - Keep `skills/headroom-sub2api-maintainer/references/gpu-kompress.md` byte-identical to `docs/stgmt-gpu-kompress.md` whenever the field report changes.

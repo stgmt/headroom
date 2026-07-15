@@ -153,6 +153,18 @@ Fix in the paired `stgmt/sub2api` profile:
 - Bind `%LOCALAPPDATA%\rtk` into Headroom at `/root/.local/share/rtk` so the
   dashboard reads the same persistent command history as the host.
 
+Native Linux/Hyper-V variant:
+- If Claude Code is installed on the Ubuntu VM host, install RTK in that same
+  user account with `stgmt/sub2api` `scripts/install-claude-rtk.sh`. Installing
+  it only in Headroom or a devcontainer repeats the original execution-path
+  bug because those filesystems do not own the host Bash process.
+- The installer preserves Claude settings and non-RTK hooks, leaves one
+  absolute `PreToolUse(Bash)` hook, applies the same accuracy exclusions, and
+  runs synthetic rewrite/exclusion probes before returning success.
+- In a split-host VM -> remote Headroom topology, VM history is authoritative.
+  Do not claim dashboard parity unless the VM RTK state is explicitly shared
+  with the Headroom host.
+
 Required proof:
 - Claude debug contains `Hook PreToolUse:Bash (PreToolUse) success` and
   `modified tool input keys: [command, description]`.
@@ -166,12 +178,17 @@ Required proof:
   savings; `headroom perf --format json` reported the same values under
   `cli_filtering`. The earlier 97.55% remains a controlled capability probe,
   not the lifetime live savings rate.
+- Native Ubuntu host proof on `devcontainer-ubuntu-2404`: a fresh Claude Code
+  call rewrote `git log -100 --stat`; RTK accounted `51,221 -> 7,792`, saving
+  84.8%, and a post-installer fresh Claude call incremented history `3 -> 4`.
 
 Owned files:
 - `stgmt/sub2api` `scripts/install-claude-rtk.ps1`
+- `stgmt/sub2api` `scripts/install-claude-rtk.sh`
 - `stgmt/sub2api` `scripts/verify-claude-code-sub2api.ps1`
 - `stgmt/sub2api` `deploy/claude-code-codex-headroom/docker-compose.yml`
 - `docs/rtk-architecture.md`
+- `skills/headroom-sub2api-maintainer/SKILL.md`
 
 ## Sync Rule
 
