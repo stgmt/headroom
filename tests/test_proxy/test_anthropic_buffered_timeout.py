@@ -329,13 +329,32 @@ def test_anthropic_memory_continuation_uses_buffered_timeout() -> None:
         _install_prefix_tracker(proxy)
         proxy.memory_handler = _MemoryHandler()
         captured_timeouts: list[httpx.Timeout | None] = []
+        captured_bodies: list[dict[str, object]] = []
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             timeout = kwargs.get("timeout")
             captured_timeouts.append(timeout)
+            captured_bodies.append(body)
             if len(body["messages"]) > 1:
                 _assert_buffered_timeout(timeout)
-            return httpx.Response(200, json=_anthropic_message_response())
+                return httpx.Response(200, json=_anthropic_message_response())
+            initial_response = _anthropic_message_response()
+            initial_response["content"] = [
+                {"type": "text", "text": "I will check memory and the filesystem."},
+                {
+                    "type": "tool_use",
+                    "id": "mem_1",
+                    "name": "memory_search",
+                    "input": {"query": "project location"},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "client_1",
+                    "name": "Bash",
+                    "input": {"command": "find /home -maxdepth 2 -type d"},
+                },
+            ]
+            return httpx.Response(200, json=initial_response)
 
         proxy._retry_request = _fake_retry  # type: ignore[assignment]
 
@@ -351,11 +370,24 @@ def test_anthropic_memory_continuation_uses_buffered_timeout() -> None:
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 64,
                 "messages": [{"role": "user", "content": "hello"}],
+                "tools": [
+                    {"name": "memory_search", "input_schema": {"type": "object"}},
+                    {"name": "Bash", "input_schema": {"type": "object"}},
+                ],
             },
         )
 
     assert len(captured_timeouts) == 2
     assert all(isinstance(timeout, httpx.Timeout) for timeout in captured_timeouts)
+    continuation_messages = captured_bodies[1]["messages"]
+    assistant_content = continuation_messages[-2]["content"]
+    assert [block.get("id") for block in assistant_content if block.get("type") == "tool_use"] == [
+        "mem_1"
+    ]
+    assert continuation_messages[-1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "mem_1", "content": "memory"}
+    ]
+    assert captured_bodies[1]["tools"] == [{"name": "Bash", "input_schema": {"type": "object"}}]
 
 
 def test_retry_request_without_override_uses_client_default_timeout():

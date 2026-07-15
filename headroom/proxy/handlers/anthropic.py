@@ -77,10 +77,75 @@ def _anthropic_content_text(content: Any) -> str:
         text = content.get("text")
         return text if isinstance(text, str) else ""
     if isinstance(content, list):
-        return "\n\n".join(
-            part for item in content if (part := _anthropic_content_text(item))
-        )
+        return "\n\n".join(part for item in content if (part := _anthropic_content_text(item)))
     return ""
+
+
+def _memory_continuation_content_for_results(
+    content: Any,
+    tool_results: list[dict[str, Any]],
+) -> tuple[list[Any], list[dict[str, Any]], list[str]]:
+    """Keep only tool calls that have server-side memory results.
+
+    A model may emit a Headroom memory call and a client-owned tool call in
+    the same assistant turn. Replaying both calls with only the memory result
+    creates an invalid Anthropic/Responses continuation. Client-owned calls
+    have not reached Claude Code yet, so defer them and let the continuation
+    issue them again after memory retrieval.
+    """
+    result_ids = {
+        str(result.get("tool_use_id", "")).strip()
+        for result in tool_results
+        if isinstance(result, dict) and str(result.get("tool_use_id", "")).strip()
+    }
+    if not isinstance(content, list):
+        return [], [], sorted(result_ids)
+
+    continuation_content: list[Any] = []
+    deferred_tool_calls: list[dict[str, Any]] = []
+    matched_result_ids: set[str] = set()
+
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continuation_content.append(block)
+            continue
+
+        tool_use_id = str(block.get("id", "")).strip()
+        if tool_use_id and tool_use_id in result_ids:
+            continuation_content.append(block)
+            matched_result_ids.add(tool_use_id)
+        else:
+            deferred_tool_calls.append(block)
+
+    return (
+        continuation_content,
+        deferred_tool_calls,
+        sorted(result_ids - matched_result_ids),
+    )
+
+
+def _without_server_memory_tools(tools: Any) -> list[Any]:
+    """Remove private Headroom memory tools after their results are injected."""
+    from headroom.proxy.memory_handler import (
+        MEMORY_TOOL_NAMES,
+        NATIVE_MEMORY_TOOL_NAME,
+        NATIVE_MEMORY_TOOL_TYPE,
+    )
+
+    if not isinstance(tools, list):
+        return []
+
+    memory_names = {*MEMORY_TOOL_NAMES, NATIVE_MEMORY_TOOL_NAME}
+    filtered: list[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            filtered.append(tool)
+            continue
+        name = tool.get("name") or tool.get("function", {}).get("name")
+        if name in memory_names or tool.get("type") == NATIVE_MEMORY_TOOL_TYPE:
+            continue
+        filtered.append(tool)
+    return filtered
 
 
 def _looks_like_claude_code_compact_prompt(content: Any) -> bool:
@@ -800,8 +865,8 @@ class AnthropicHandlerMixin:
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])
-            claude_compact_request, claude_compact_message_index = (
-                _is_claude_code_compact_request(body)
+            claude_compact_request, claude_compact_message_index = _is_claude_code_compact_request(
+                body
             )
             claude_compact_message = (
                 copy.deepcopy(messages[claude_compact_message_index])
@@ -3061,10 +3126,40 @@ class AnthropicHandlerMixin:
                             )
 
                             if tool_results:
+                                (
+                                    assistant_content,
+                                    deferred_tool_calls,
+                                    unmatched_result_ids,
+                                ) = _memory_continuation_content_for_results(
+                                    resp_json.get("content", []),
+                                    tool_results,
+                                )
+                                if unmatched_result_ids:
+                                    logger.warning(
+                                        f"[{request_id}] Memory: Skipping continuation because "
+                                        f"{len(unmatched_result_ids)} tool result(s) have no matching "
+                                        "assistant tool_use"
+                                    )
+                                    tool_results = []
+
+                            if tool_results:
+                                if deferred_tool_calls:
+                                    deferred_names = sorted(
+                                        {
+                                            str(call.get("name", "unknown"))
+                                            for call in deferred_tool_calls
+                                        }
+                                    )
+                                    logger.info(
+                                        f"[{request_id}] Memory: Deferred "
+                                        f"{len(deferred_tool_calls)} client-owned tool call(s) "
+                                        f"from continuation: {deferred_names}"
+                                    )
+
                                 # Create continuation messages
                                 assistant_msg = {
                                     "role": "assistant",
-                                    "content": resp_json.get("content", []),
+                                    "content": assistant_content,
                                 }
                                 user_msg = {
                                     "role": "user",
@@ -3078,8 +3173,11 @@ class AnthropicHandlerMixin:
 
                                 # Make continuation API call
                                 continuation_body = {**body, "messages": continuation_messages}
-                                if tools:
-                                    continuation_body["tools"] = tools
+                                continuation_tools = _without_server_memory_tools(tools)
+                                if continuation_tools:
+                                    continuation_body["tools"] = continuation_tools
+                                else:
+                                    continuation_body.pop("tools", None)
 
                                 cont_response = await self._retry_request(
                                     "POST",
@@ -3572,7 +3670,10 @@ class AnthropicHandlerMixin:
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
                     result = await self._run_compression_in_executor(
-                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count: (
+                        lambda messages=messages,
+                        model=model,
+                        context_limit=context_limit,
+                        frozen_message_count=frozen_message_count: (
                             self.anthropic_pipeline.apply(
                                 messages=messages,
                                 model=model,
@@ -4020,11 +4121,8 @@ class AnthropicHandlerMixin:
         )
 
 
-
 # sub2api downstream Claude Code handler watchdog patch
-_sub2api_original_handle_anthropic_messages = (
-    AnthropicHandlerMixin.handle_anthropic_messages
-)
+_sub2api_original_handle_anthropic_messages = AnthropicHandlerMixin.handle_anthropic_messages
 
 
 async def _sub2api_handle_anthropic_messages_with_watchdog(
@@ -4124,8 +4222,7 @@ async def _sub2api_handle_anthropic_messages_with_watchdog(
     retry_headers["x-sub2api-headroom-watchdog-retry"] = "1"
     retry_request = _Sub2apiWatchdogRetryRequest(request, retry_headers)
     logger.warning(
-        "event=claude_code_handler_watchdog_retry "
-        "session_id=%s agent_id=%s mode=bypass",
+        "event=claude_code_handler_watchdog_retry session_id=%s agent_id=%s mode=bypass",
         claude_session,
         claude_agent,
     )
@@ -4136,8 +4233,7 @@ async def _sub2api_handle_anthropic_messages_with_watchdog(
     )
     if not retry_timed_out:
         logger.warning(
-            "event=claude_code_handler_watchdog_retry_ok "
-            "session_id=%s agent_id=%s",
+            "event=claude_code_handler_watchdog_retry_ok session_id=%s agent_id=%s",
             claude_session,
             claude_agent,
         )
@@ -4146,8 +4242,7 @@ async def _sub2api_handle_anthropic_messages_with_watchdog(
     from fastapi.responses import StreamingResponse
 
     logger.error(
-        "event=claude_code_handler_watchdog_retry_timeout "
-        "session_id=%s agent_id=%s timeout_ms=%s",
+        "event=claude_code_handler_watchdog_retry_timeout session_id=%s agent_id=%s timeout_ms=%s",
         claude_session,
         claude_agent,
         timeout_ms,
@@ -4165,10 +4260,7 @@ async def _sub2api_handle_anthropic_messages_with_watchdog(
                 ),
             },
         }
-        yield (
-            "event: error\n"
-            f"data: {_sub2api_json.dumps(error_event)}\n\n"
-        ).encode()
+        yield (f"event: error\ndata: {_sub2api_json.dumps(error_event)}\n\n").encode()
 
     return StreamingResponse(
         _timeout_sse(),
@@ -4177,6 +4269,4 @@ async def _sub2api_handle_anthropic_messages_with_watchdog(
     )
 
 
-AnthropicHandlerMixin.handle_anthropic_messages = (
-    _sub2api_handle_anthropic_messages_with_watchdog
-)
+AnthropicHandlerMixin.handle_anthropic_messages = _sub2api_handle_anthropic_messages_with_watchdog

@@ -190,6 +190,54 @@ Owned files:
 - `docs/rtk-architecture.md`
 - `skills/headroom-sub2api-maintainer/SKILL.md`
 
+## 2026-07-15: Mixed server-memory and client tool calls broke Claude Code
+
+Problem:
+Headroom can inject private `memory_*` tools into a Claude Code request. GPT-5.6
+may call `memory_search` and a client-owned tool such as `Bash` in the same
+assistant turn. The buffered Anthropic handler replayed every `tool_use` in its
+internal continuation but generated a `tool_result` only for the memory call.
+sub2api translated that incomplete turn to the OpenAI Responses protocol, which
+rejected it with `400 No tool output found for function call call_*` before
+Claude Code received its first real tool call.
+
+The same prompt failed twice in the Hyper-V Ubuntu Claude host:
+- session `aee9a005-acde-4a9e-a877-3152ea97623f` at `07:26:39Z`, missing call
+  `call_WoOaTjIoJQ8N1Kier0lMB9Bl`;
+- the retry at `07:47:42Z`, missing call
+  `call_lzg6wbTB8J2TpkIHRi0VyPF4`.
+
+Fix:
+- Build the server-side continuation assistant turn from only those `tool_use`
+  blocks whose IDs have matching memory `tool_result` blocks.
+- Defer client-owned tool calls; because the buffered first response never
+  reached Claude Code, the continuation can safely issue them again.
+- Remove all private Headroom memory tool definitions from the continuation so
+  the model cannot reissue a tool that Claude Code does not own.
+- Refuse the internal continuation if a generated memory result has no matching
+  assistant `tool_use`.
+
+Files:
+- `headroom/proxy/handlers/anthropic.py`
+- `tests/test_anthropic_memory_mixed_tools.py`
+- `tests/test_proxy/test_anthropic_buffered_timeout.py`
+
+Required proof:
+- Unit contract tests cover mixed `memory_search + Bash`, unmatched result IDs,
+  and removal of private memory definitions.
+- A live forced mixed call from the Ubuntu VM logs
+  `Memory: Deferred 1 client-owned tool call(s) from continuation: ['Bash']`.
+- The continuation and all following sub2api `/v1/messages` calls return HTTP
+  200 with no `openai_messages.forward_failed`.
+- Claude Code reports both the memory result and the Bash result instead of an
+  API error or `memory_search` unavailable.
+
+Live proof after the fix:
+- Headroom request `hr_1784103012_000005` deferred Bash and completed its
+  continuation successfully.
+- The forced VM probe returned `memory_search: совпадений нет` and
+  `pwd: /home/migration`.
+
 ## Sync Rule
 
 When this fork changes a behavior used by the sub2api Docker profile, update the sub2api stack too:
