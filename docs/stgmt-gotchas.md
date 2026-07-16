@@ -238,6 +238,37 @@ Live proof after the fix:
 - The forced VM probe returned `memory_search: совпадений нет` and
   `pwd: /home/migration`.
 
+## 2026-07-16: Default 60 RPM limiter broke local Claude fan-out
+
+Problem:
+Headroom enables a 60 requests/minute token bucket by default. The Anthropic
+handler keys that bucket by the first 16 characters of the API key plus client
+IP. Every local Claude Code window and subagent used the same placeholder key
+and loopback address, so unrelated agents depleted one shared bucket. Headroom
+returned `429 {"detail":"Rate limited. Retry after 0.3s"}` before sub2api saw
+the request. Claude Code exposed the failure inside a WebSearch tool result and
+did not replay the lost tool call.
+
+Evidence:
+- Headroom's lifetime `headroom_requests_rate_limited_total` was 1009.
+- Completed traffic reached 68, 74, 63, and 57 requests in consecutive minutes;
+  rejected requests were not present in the request JSONL.
+- A controlled 96-way invalid-key burst against the old live profile returned
+  exactly 60 HTTP 401 responses and 36 local HTTP 429 responses. The invalid
+  key kept the probe out of model billing while exercising the real limiter.
+
+Fix in the paired `stgmt/sub2api` loopback profile:
+- Set `HEADROOM_RPM=6000` and `HEADROOM_TPM=100000000` in compose and generated
+  `.env` files. Keep these values configurable for operators.
+- Verify effective values through Headroom `/stats`; source or container-env
+  inspection alone is insufficient.
+- Run the repository-owned 96-way invalid-key burst probe after recreating the
+  Headroom service. Any HTTP 429 is a regression.
+
+Do not classify this exact FastAPI JSON body as an OpenAI subscription cooldown.
+Real upstream quota errors are recorded by sub2api and have different account,
+usage-log, and error-log evidence.
+
 ## Sync Rule
 
 When this fork changes a behavior used by the sub2api Docker profile, update the sub2api stack too:

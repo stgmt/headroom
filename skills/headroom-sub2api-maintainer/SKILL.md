@@ -36,6 +36,7 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 - Host `nvidia-smi` or Docker `gpus: all` alone does not make Kompress use CUDA. The image needs CUDA PyTorch, compose must set `HEADROOM_KOMPRESS_BACKEND=pytorch`, Docker inspect must show GPU `DeviceRequests`, and a live preload must return backend `pytorch` on device `cuda`. Keep CPU as the portable fallback.
 - RTK remains command-side and must be installed in the same OS/user account that executes Claude Code Bash. Container-only RTK cannot rewrite host commands. For Windows Claude Code plus WSL Docker, use the paired `install-claude-rtk.ps1`, pinned Windows plus WSL RTK, and one `PreToolUse(Bash)` bridge with `MSYS2_ARG_CONV_EXCL='*'`. For Claude Code installed on a native Ubuntu host or Hyper-V VM outside its devcontainers, use `install-claude-rtk.sh` as that Claude user and one absolute native-Linux hook. Never install RTK only in a devcontainer when Claude runs on the outer Ubuntu host. Both topologies require RTK 0.42.4 and exclusions for `cat`/`git diff`/`git show`/`curl`.
 - Bind host RTK state at `/root/.local/share/rtk` only when Headroom can access that same filesystem. In split-host VM -> remote Headroom layouts, prove VM-side savings from the VM's `rtk gain`; do not claim Headroom dashboard parity unless that history is explicitly shared.
+- The loopback-only sub2api profile must not inherit Headroom's library default of 60 RPM. Every Claude window and subagent shares one API-key-plus-IP bucket, so that default turns healthy local fan-out into `429 {"detail":"Rate limited. Retry after ..."}` tool failures that Claude Code does not reliably replay. The paired profile defaults to `HEADROOM_RPM=6000` and `HEADROOM_TPM=100000000`; verify the effective values through `/stats` and run its invalid-key burst probe after recreating Headroom.
 
 ## Required Checks
 
@@ -58,6 +59,7 @@ wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api benchmark-headroom-kompr
 rtk gain --format json
 wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api rtk gain --format json
 wsl.exe -d Ubuntu-24.04 -- docker exec headroom-sub2api headroom perf --format json
+node backend/docs/skills/sub2api-claude-code-codex/scripts/test-headroom-rate-limit-burst.mjs http://127.0.0.1:8787 96
 ```
 
 Before any RTK claim, locate the actual Claude binary and choose the installer
