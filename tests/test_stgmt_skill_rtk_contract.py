@@ -38,3 +38,15 @@ def test_gotcha_ledger_keeps_native_linux_proof_and_owned_installer() -> None:
     assert "devcontainer-ubuntu-2404" in text
     assert "51,221 -> 7,792" in text
     assert "history `3 -> 4`" in text
+
+
+def test_skill_and_gotcha_preserve_client_selected_effort() -> None:
+    skill = SKILL.read_text(encoding="utf-8")
+    gotchas = GOTCHAS.read_text(encoding="utf-8")
+
+    assert "HEADROOM_OUTPUT_SHAPER=1" in skill
+    assert "HEADROOM_EFFORT_ROUTER=0" in skill
+    assert "pre-Headroom request-body tap" in skill
+    assert "181 JSONL responses" in gotchas
+    assert "120 as `low`" in gotchas
+    assert "post-fix four-turn probe was `4/4 max`" in gotchas

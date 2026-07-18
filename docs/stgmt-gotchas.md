@@ -269,6 +269,37 @@ Do not classify this exact FastAPI JSON body as an OpenAI subscription cooldown.
 Real upstream quota errors are recorded by sub2api and have different account,
 usage-log, and error-log evidence.
 
+## 2026-07-18: Output shaper silently downgraded Claude max effort
+
+Problem:
+Claude Code correctly sent `output_config.effort=max` on every turn, and its
+JSONL labeled every assistant message `effort=max`. The paired Headroom profile
+enabled `HEADROOM_OUTPUT_SHAPER=1` but omitted `HEADROOM_EFFORT_ROUTER`.
+Headroom therefore used the router's default-on behavior, classified clean
+`tool_result` turns as mechanical continuations, and rewrote `max` to `low`
+before forwarding them to sub2api.
+
+Evidence before the fix:
+- Exact timestamp plus token-usage matching found 181 JSONL responses labeled
+  `max`; sub2api recorded only 61 as `max` and 120 as `low`.
+- A four-request VM tool-loop wire tap saw `max` on all four requests before
+  Headroom. sub2api recorded the first as `max` and the next three as `low`.
+- The downgrade implementation is `route_effort()` in
+  `headroom/proxy/output_shaper.py`; its default target is `low`.
+
+Fix in the paired `stgmt/sub2api` profile:
+- Keep `HEADROOM_OUTPUT_SHAPER=1` for verbosity steering.
+- Set `HEADROOM_EFFORT_ROUTER=0` explicitly in compose, generated `.env`, the
+  installer, and the live runtime.
+- Make the verifier fail if the effective container environment does not
+  contain both values.
+
+Required live proof:
+- Capture a real Claude Code `--effort max` tool-loop before Headroom.
+- Match every request to sub2api `usage_logs` by completion time and token use.
+- Both sides must report `max` for every initial and continuation request. The
+  post-fix four-turn probe was `4/4 max` before and after Headroom.
+
 ## Sync Rule
 
 When this fork changes a behavior used by the sub2api Docker profile, update the sub2api stack too:
