@@ -1427,6 +1427,8 @@ def is_anthropic_auth(headers: dict[str, str]) -> bool:
     auth = headers.get("authorization", "")
     if auth.startswith("Bearer sk-ant-"):
         return True
+    if auth.startswith("Bearer sk-sub2api"):
+        return True
     return False
 
 

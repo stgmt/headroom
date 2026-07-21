@@ -1077,6 +1077,31 @@ def test_v1_models_routes_claude_code_gateway_discovery_to_anthropic() -> None:
     ]
 
 
+def test_v1_models_routes_sub2api_bearer_gateway_to_anthropic() -> None:
+    """Claude Code can use a local sub2api key as an Anthropic-compatible
+    gateway token. Model discovery must hit the Anthropic target, not OpenAI.
+    """
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            response = client.get(
+                "/v1/models",
+                headers={"authorization": "Bearer sk-sub2api-local-test"},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "base_url": "https://api.anthropic.test",
+        "provider": "anthropic",
+    }
+    assert calls == [("/v1/models", "https://api.anthropic.test", "anthropic")]
+
+
 def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
     class FakeAsyncClient:
         def __init__(self) -> None:

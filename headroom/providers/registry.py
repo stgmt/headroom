@@ -365,6 +365,7 @@ def _is_anthropic_auth(headers: Mapping[str, str]) -> bool:
         headers.get("x-api-key")
         or headers.get("anthropic-version")
         or authorization.startswith("Bearer sk-ant-")
+        or authorization.startswith("Bearer sk-sub2api")
         or _is_claude_code_client(user_agent)
     )
 

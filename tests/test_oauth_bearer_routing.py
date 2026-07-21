@@ -25,6 +25,10 @@ class TestIsAnthropicAuth:
         """API key prefix in Bearer header still detected as Anthropic."""
         assert is_anthropic_auth({"authorization": "Bearer sk-ant-api03-xxx"}) is True
 
+    def test_bearer_sub2api_key(self):
+        """Local sub2api keys front an Anthropic-compatible gateway."""
+        assert is_anthropic_auth({"authorization": "Bearer sk-sub2api-test"}) is True
+
     def test_bearer_openai(self):
         assert is_anthropic_auth({"authorization": "Bearer sk-proj-xxx"}) is False
 
@@ -98,6 +102,14 @@ class TestModelsRouting:
             )
         assert any("anthropic.test" in url for _, url in fake.calls)
 
+    def test_models_with_sub2api_bearer_routes_anthropic(self):
+        with self._make_client() as (client, fake):
+            client.get(
+                "/v1/models",
+                headers={"authorization": "Bearer sk-sub2api-testtoken"},
+            )
+        assert any("anthropic.test" in url for _, url in fake.calls)
+
     def test_models_with_openai_bearer_routes_openai(self):
         with self._make_client() as (client, fake):
             client.get(
@@ -157,6 +169,14 @@ class TestCatchAllRouting:
             client.get(
                 "/v1/some/unknown/path",
                 headers={"authorization": "Bearer sk-ant-oat01-xxx"},
+            )
+        assert any("anthropic.test" in url for _, url in fake.calls)
+
+    def test_catchall_sub2api_bearer_routes_anthropic(self):
+        with self._make_client() as (client, fake):
+            client.get(
+                "/v1/some/unknown/path",
+                headers={"authorization": "Bearer sk-sub2api-testtoken"},
             )
         assert any("anthropic.test" in url for _, url in fake.calls)
 

@@ -300,6 +300,55 @@ Required live proof:
 - Both sides must report `max` for every initial and continuation request. The
   post-fix four-turn probe was `4/4 max` before and after Headroom.
 
+## 2026-07-22: sub2api Bearer keys must route as Anthropic-compatible
+
+Problem:
+The paired Claude Code stack uses Headroom in front of sub2api and authenticates
+Claude Code with a local placeholder key such as `Bearer sk-sub2api...`. That key
+is not an OpenAI key. If Headroom classifies any `sk-*` Bearer token as OpenAI,
+`/v1/models` and catch-all proxy calls are sent to the OpenAI-compatible route
+and fail with an upstream-style `Incorrect API key provided: sk-sub2a***`
+instead of reaching sub2api's Anthropic-compatible `/v1/messages` path.
+
+Evidence:
+- The live container originally had no `sk-sub2api` branch in
+  `headroom.providers.registry._is_anthropic_auth` or
+  `headroom.proxy.helpers.is_anthropic_auth`.
+- After patching the live site-packages copy,
+  `is_anthropic_auth({"authorization":"Bearer sk-sub2api-test"})` returned
+  `True`.
+- A Headroom `/v1/models` probe returned a mixed provider catalog that included
+  `gpt-5.6-sol`, `qwen3.8-max-preview`, and `fable`.
+
+Fix:
+- Treat `Authorization: Bearer sk-sub2api...` as Anthropic-compatible in both
+  the provider registry and proxy helper classifier.
+- Cover both `/v1/models` and catch-all proxy routing with regression tests.
+- Rebuild/recreate the Headroom image from the fork; copying patched files into
+  a running container is only an emergency proof, not a durable install.
+
+## 2026-07-22: disable CPU Kompress when CUDA proof is absent
+
+Problem:
+The sub2api Docker profile can auto-detect no usable Docker GPU while leaving
+`HEADROOM_FORCE_KOMPRESS=1`. In that state Headroom may use CPU ONNX Kompress on
+Claude Code's hot path, which previously caused multi-minute compression stalls
+and request watchdog failures. A Docker container being healthy is not enough;
+the important proof is the effective compression backend.
+
+Fix in the paired `stgmt/sub2api` profile:
+- For CUDA profile: `HEADROOM_FORCE_KOMPRESS=1`,
+  `HEADROOM_DISABLE_KOMPRESS=0`, `HEADROOM_KOMPRESS_BACKEND=pytorch`.
+- For CPU/no-GPU profile: `HEADROOM_FORCE_KOMPRESS=0`,
+  `HEADROOM_DISABLE_KOMPRESS=1`. Re-enable Kompress only after a live CUDA
+  preload proof succeeds.
+
+Required live proof:
+- `docker inspect headroom-sub2api` shows the intended environment.
+- `GET /health` reports `kompress.enabled=false`, `status=disabled`, and
+  no growing compression queue for CPU/no-GPU installs; for CUDA installs,
+  benchmark and preload must prove `pytorch` on `cuda`.
+
 ## Sync Rule
 
 When this fork changes a behavior used by the sub2api Docker profile, update the sub2api stack too:
