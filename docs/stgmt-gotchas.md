@@ -349,6 +349,38 @@ Required live proof:
   no growing compression queue for CPU/no-GPU installs; for CUDA installs,
   benchmark and preload must prove `pytorch` on `cuda`.
 
+## 2026-07-23: `/stats` runtime counters hid persisted request history
+
+Problem:
+The request JSONL survived container recreation on the `/root/.headroom` bind
+mount, but `RequestLogger` started with an empty deque and `/stats.requests`,
+`/stats.tokens`, and `/stats.latency` read process-local metrics. After a
+restart the dashboard/API therefore looked almost empty even though tens of
+thousands of completed requests remained in `proxy-requests.jsonl`.
+
+Evidence before the fix:
+- Live `/stats.requests.total` showed 341 requests for the current process.
+- `persistent_savings.lifetime.requests` showed 63,193 requests.
+- The bind-mounted request log contained 63,621 valid, unique request IDs from
+  2026-07-10 through 2026-07-23 plus one malformed line.
+
+Fix:
+- `RequestLogger` streams the JSONL once at startup, skips malformed rows,
+  deduplicates request IDs, restores the bounded recent-request feed, and
+  maintains a JSON-safe lifetime aggregate as new rows are appended.
+- `/stats.request_history` exposes completed-request totals, provider/model
+  breakdowns, tokens, latency, transforms, coverage, and source time range.
+- Existing top-level request/token/latency fields remain runtime-scoped for
+  compatibility and expose their durable blocks under `lifetime`.
+- `/stats/reset` remains runtime-only and never truncates the request log.
+
+Required live proof:
+- Record request-history totals, restart/recreate Headroom, and verify totals
+  and range are unchanged before new traffic.
+- Send one fresh request and verify exactly one new unique request and no
+  double counting after a second restart.
+- Keep the request-log path on the `/root/.headroom` host bind mount.
+
 ## Sync Rule
 
 When this fork changes a behavior used by the sub2api Docker profile, update the sub2api stack too:

@@ -34,6 +34,7 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 - Use one autostart owner for the whole compose stack: `Sub2API Codex Proxy Stack Autostart`. Remove stale separate host `headroom-proxy` tasks or Startup-folder launchers.
 - On Docker-in-WSL, Windows `127.0.0.1:8787` can hang even when Docker health is green. If WSL/Docker health works but Windows localhost hangs, publish Headroom on `0.0.0.0`, set Claude Code `ANTHROPIC_BASE_URL` to `http://<wsl-eth0-ip>:8787`, and keep direct sub2api `:18081` only as a diagnostic/admin bypass.
 - Runtime proof beats source proof. A committed patch is not active until the running `headroom-sub2api` container proves it.
+- `/stats.requests`, `/stats.tokens`, and `/stats.latency` are runtime-scoped; durable completed-request analytics live in `/stats.request_history` and the nested `lifetime` blocks, hydrated from the bind-mounted request JSONL. A restart must preserve totals, model/provider breakdowns, token aggregates, latency, transforms, and time range. `/stats/reset` must never delete that history.
 - Before editing Headroom, classify the symptom with `references/session-failure-registry.md` and correlate the Claude session, Headroom request, sub2api row, and provider outcome. No Headroom request means the failure is in the client, hook, or MCP path; do not mutate the proxy to compensate. Respect analysis/report-only requests and do not run broad suites as a substitute for tracing the original request.
 - Host `nvidia-smi` or Docker `gpus: all` alone does not make Kompress use CUDA. The image needs CUDA PyTorch, compose must set `HEADROOM_KOMPRESS_BACKEND=pytorch`, Docker inspect must show GPU `DeviceRequests`, and a live preload must return backend `pytorch` on device `cuda`. Keep CPU as the portable fallback.
 - Treat a live-proven CUDA deployment as sticky. The sub2api GPU overlay must own `target: gpu`, `gpus: all`, `HEADROOM_KOMPRESS_BACKEND=pytorch`, `HEADROOM_FORCE_KOMPRESS=1`, and `HEADROOM_DISABLE_KOMPRESS=0`; setup/autostart may resolve `auto` to CUDA but must never silently downgrade persisted `cuda` after a transient WSL/NVIDIA probe failure. Do not start this profile with a bare base-compose launcher.
@@ -94,6 +95,11 @@ Expected mixed-memory marker:
 `Memory: Deferred 1 client-owned tool call(s) from continuation: ['Bash']`
 
 For native compact routing, the installed handler must contain `_is_claude_code_compact_request`, `x-sub2api-claude-compact`, and `headroom:claude_code_compact_prompt_preserved`. A real forked Claude Code `/compact`, not only a synthetic probe, must produce that transform marker in `proxy-requests.jsonl` and a Spark/Luna compact route in sub2api `usage_logs`.
+
+For durable stats, capture `/stats.request_history`, recreate Headroom, and
+require the same request total, first/last timestamps, token totals, and
+provider/model breakdown before new traffic. Then send one request and require
+exactly one new unique request both before and after a second restart.
 
 ## Update Discipline
 

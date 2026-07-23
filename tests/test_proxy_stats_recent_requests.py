@@ -11,6 +11,7 @@ from headroom.proxy.server import create_app
 class FakeRequestLogger:
     def __init__(self) -> None:
         self._logs: list[dict[str, object]] = []
+        self._history: dict[str, object] = {}
 
     @property
     def logs(self) -> list[dict[str, object]]:
@@ -22,6 +23,9 @@ class FakeRequestLogger:
 
     def get_recent(self, limit: int) -> list[dict[str, object]]:
         return self._logs[-limit:]
+
+    def history_stats(self) -> dict[str, object]:
+        return self._history
 
 
 class FakeLogEntry(dict[str, object]):
@@ -77,12 +81,33 @@ def test_stats_refreshes_recent_requests_when_cached() -> None:
         assert first_response.json()["recent_requests"][-1]["model"] == "gpt-4.1"
 
         logger.logs = [first_log, second_log]
+        logger._history = {
+            "requests": {
+                "total": 2,
+                "cached": 0,
+                "failed_logged": 0,
+                "by_provider": {"openai": 1, "anthropic": 1},
+                "by_model": {"gpt-4.1": 1, "claude-sonnet": 1},
+            },
+            "tokens": {"input_original": 300, "input_optimized": 180, "saved": 120},
+            "latency": {"total_requests": 2, "average_ms": 25.0},
+        }
         second_response = client.get("/stats?cached=1")
         assert second_response.status_code == 200
         second_payload = second_response.json()
+        reset_response = client.post("/stats/reset")
+        assert reset_response.status_code == 200
+        after_reset = client.get("/stats").json()
 
     assert second_payload["recent_requests"][-1]["model"] == "claude-sonnet"
     assert second_payload["request_logs"][-1]["model"] == "claude-sonnet"
+    assert second_payload["request_history"]["requests"]["total"] == 2
+    assert second_payload["requests"]["scope"] == "runtime"
+    assert second_payload["requests"]["lifetime"]["total"] == 2
+    assert second_payload["tokens"]["lifetime"]["saved"] == 120
+    assert second_payload["latency"]["lifetime"]["average_ms"] == 25.0
+    assert after_reset["request_history"]["requests"]["total"] == 2
+    assert after_reset["requests"]["total"] == 0
 
 
 def test_agent_usage_totals_use_proxy_only_savings(monkeypatch: pytest.MonkeyPatch) -> None:

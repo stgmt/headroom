@@ -3173,6 +3173,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         persistent_savings = m.savings_tracker.stats_preview()
         display_session = persistent_savings.get("display_session", {})
         recent_request_logs = proxy.logger.get_recent(10_000) if proxy.logger else []
+        request_history = (
+            proxy.logger.history_stats()
+            if proxy.logger and hasattr(proxy.logger, "history_stats")
+            else {}
+        )
         recent_request_payload = _build_recent_request_payload()
 
         # Tool-schema deferral savings: tool-definition tokens kept out of the
@@ -3304,6 +3309,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 },
             },
             "requests": {
+                "scope": "runtime",
                 "total": m.requests_total,
                 "cached": m.requests_cached,
                 "rate_limited": m.requests_rate_limited,
@@ -3311,8 +3317,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "by_provider": dict(m.requests_by_provider),
                 "by_model": dict(m.requests_by_model),
                 "by_stack": dict(m.requests_by_stack),
+                "lifetime": request_history.get("requests", {}),
             },
             "tokens": {
+                "scope": "runtime",
                 "input": m.tokens_input_total,
                 "output": m.tokens_output_total,
                 "output_saved": output_reduction.get("tokens_saved", 0),
@@ -3386,12 +3394,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     else 0,
                     2,
                 ),
+                "lifetime": request_history.get("tokens", {}),
             },
             "latency": {
+                "scope": "runtime",
                 "average_ms": avg_latency_ms,
                 "min_ms": min_latency_ms,
                 "max_ms": max_latency_ms,
                 "total_requests": m.latency_count,
+                "lifetime": request_history.get("latency", {}),
             },
             "overhead": {
                 "average_ms": avg_overhead_ms,
@@ -3492,6 +3503,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # showing $0.00 forever.
             "litellm_available": LITELLM_AVAILABLE,
             "persistent_savings": persistent_savings,
+            "request_history": request_history,
             "prefix_cache": prefix_cache_stats,
             "cost": _merge_cost_stats(
                 proxy.cost_tracker.stats() if proxy.cost_tracker else None,
@@ -3598,6 +3610,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _stats_snapshot["expires_at"] = time.monotonic() + DASHBOARD_STATS_CACHE_TTL_SECONDS
             return payload
 
+    def _refresh_request_history(payload: dict[str, Any]) -> None:
+        if not proxy.logger or not hasattr(proxy.logger, "history_stats"):
+            return
+        history = proxy.logger.history_stats()
+        payload["request_history"] = history
+        for section, history_key in (
+            ("requests", "requests"),
+            ("tokens", "tokens"),
+            ("latency", "latency"),
+        ):
+            current = dict(payload.get(section) or {})
+            current["lifetime"] = history.get(history_key, {})
+            payload[section] = current
+
     @app.get("/stats")
     async def stats(request: Request, cached: bool = False):
         """Get comprehensive proxy statistics.
@@ -3622,6 +3648,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         include_sensitive = _request_is_loopback(request)
         if cached:
             payload = dict(await _get_cached_stats_payload())
+            _refresh_request_history(payload)
             if include_sensitive:
                 # Refresh the per-request tail on top of the cached snapshot.
                 payload.update(_build_recent_request_payload())
@@ -3638,7 +3665,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.post("/stats/reset", dependencies=[Depends(_require_loopback)])
     async def stats_reset():
-        """Reset in-memory proxy stats for local test/debug isolation."""
+        """Reset runtime stats without deleting persisted request history."""
         await proxy.metrics.reset_runtime()
         if proxy.cost_tracker:
             proxy.cost_tracker.reset_runtime()

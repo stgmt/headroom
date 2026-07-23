@@ -23,6 +23,7 @@ Use the same IDs in issues, tests, commit messages, and reports.
 | `F22` | Multiple launchers or named volumes split ownership and state. | One canonical stack owner and host bind mounts; prove task state, mounts, and persisted files after restart. |
 | `F23` | Container health was green while the Claude host route refused connections. | Probe every network hop used by the actual host before touching Headroom internals. |
 | `F24` | Focused/source tests were called end-to-end proof. | Pair focused tests with a rebuilt running revision, negative control, and original-client reproduction; respect analysis-only requests. |
+| `F25` | `/stats` looked empty after restart although request logs survived. | Hydrate `request_history` from the persisted JSONL, keep runtime scope explicit, and prove stable totals across two restarts plus an exact +1 after fresh traffic. |
 
 When a new Headroom incident does not fit an existing ID, add it first to the
 canonical sub2api registry, mirror the owned subset here, update

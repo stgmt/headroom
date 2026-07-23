@@ -17,6 +17,7 @@ Keep the Claude Code + Headroom + sub2api/Codex subscription path reliable while
 - Claude Code handler watchdog with one bypass/passthrough retry before 504.
 - Embedding server sidecar module and socket embedder factory path.
 - Optional CUDA PyTorch Kompress runtime through the sub2api GPU image stage and compose overlay.
+- Durable `/stats.request_history` hydration from the persisted request JSONL across process/container restarts.
 
 ## Verification Commands
 
@@ -72,3 +73,4 @@ generalize that multiplier without rerunning the fixture on the target GPU.
 - The Docker runtime is the source of truth for whether a patch is active.
 - Keep gotchas in this repo and mirror operational instructions into the sub2api skill when they affect installation or verification.
 - GPU enablement belongs to the sub2api Docker profile: Headroom already implements the PyTorch CUDA batch path, while the image/compose must provide CUDA Torch and GPU devices.
+- `/stats` runtime counters and uptime may reset, but `request_history` must be restored from the bind-mounted request JSONL. Never present current-process totals as lifetime totals.

@@ -136,7 +136,12 @@ curl http://localhost:8787/health
 
 ### `GET /stats`
 
-Live session statistics plus durable `persistent_savings` totals. Stored at `~/.headroom/proxy_savings.json` (override with `HEADROOM_SAVINGS_PATH`).
+Live runtime statistics plus two durable views:
+
+- `persistent_savings` stores compression/cache savings in `~/.headroom/proxy_savings.json` (override with `HEADROOM_SAVINGS_PATH`).
+- `request_history` is rebuilt from the append-only request JSONL configured by `--log-file`. It includes lifetime completed-request counts, provider/model breakdowns, tokens, latency, transforms, source coverage, malformed-line count, and time range.
+
+For backward compatibility, `requests.total`, `tokens.*`, and `latency.*` remain current-runtime counters and now carry `scope: runtime`. Their durable counterparts are also available at `requests.lifetime`, `tokens.lifetime`, and `latency.lifetime`. `POST /stats/reset` resets only runtime counters and never deletes request history.
 
 ```bash
 curl http://localhost:8787/stats
