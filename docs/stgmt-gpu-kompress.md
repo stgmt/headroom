@@ -65,6 +65,10 @@ command succeeded. The sub2api start script now normalizes the text and retries
 that transient class on every WSL command. The real post-fix Scheduled Task
 ended with `LastTaskResult=0` and retained CUDA.
 
+The verifier follows the same rule: it addresses the selected WSL distro,
+retries bounded `Wsl/Service/0x8007274c` failures, and refuses to classify a
+failed `docker inspect` as a CPU profile with CUDA checks skipped.
+
 Do not use a bare `docker compose up` launcher for a CUDA installation. The
 canonical setup/recovery scripts select `docker-compose.gpu.yml`; the overlay
 is the runtime ownership boundary for GPU DeviceRequests and Kompress enable
