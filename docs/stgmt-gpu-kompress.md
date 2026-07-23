@@ -34,7 +34,11 @@ Primary external references:
 
 The sub2api profile keeps a portable `cpu` image target and adds an opt-in
 `gpu` target with `torch==2.11.0+cu128`. Its GPU Compose overlay requests all
-GPUs and selects the PyTorch backend. Runtime proof requires all of:
+GPUs, selects the PyTorch backend, and overrides stale portable
+`HEADROOM_FORCE_KOMPRESS=0` / `HEADROOM_DISABLE_KOMPRESS=1` values. A persisted
+`HEADROOM_ACCELERATOR=cuda` selection is sticky: `auto` may detect and upgrade
+to CUDA, but only an explicit `cpu` choice may downgrade it. Runtime proof
+requires all of:
 
 1. non-empty Docker `DeviceRequests`
 2. `torch.cuda.is_available() == true`
@@ -60,6 +64,11 @@ that WSL could return UTF-16/NUL `Wsl/Service/0x8007274c` after an earlier WSL
 command succeeded. The sub2api start script now normalizes the text and retries
 that transient class on every WSL command. The real post-fix Scheduled Task
 ended with `LastTaskResult=0` and retained CUDA.
+
+Do not use a bare `docker compose up` launcher for a CUDA installation. The
+canonical setup/recovery scripts select `docker-compose.gpu.yml`; the overlay
+is the runtime ownership boundary for GPU DeviceRequests and Kompress enable
+flags.
 
 ## Limits
 
