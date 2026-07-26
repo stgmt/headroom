@@ -409,8 +409,10 @@ Mechanism:
   and completed normally.
 
 Fix:
-- `CooldownHeldStream` converts an eligible streaming 429 into an HTTP 200 SSE
-  hold before the error reaches Claude Code.
+- `CooldownHeldStream` converts an eligible streaming failure into an HTTP 200
+  SSE hold before the error reaches Claude Code. Defaults cover `429`, `502`,
+  `503`, `504`, and `529`; final transport failures enter the same path after
+  ordinary short retries are exhausted.
 - It emits `event: ping`, honors the full `Retry-After`, and retries the exact
   original request after the cooldown.
 - All requests for the same upstream URL and hashed credential share one
@@ -422,6 +424,17 @@ Fix:
 - `400/401` and other non-retryable errors remain visible. The default paired
   profile holds for at most six hours; it never enables GPT/Qwen fallback in
   `anthropic-only`.
+- `/health.runtime.upstream_recovery` exposes active holds, cooling routes, next
+  probe delay, recoveries, timeouts, cancellations, and transport failures.
+  Process readiness remains separate: a healthy proxy may intentionally be
+  holding work while the only provider account is in a real quota window.
+
+This is not just a retry loop. The complete recovery chain is: sub2api persists
+the provider reset; its scheduler automatically admits the account after that
+timestamp; a successful Anthropic response clears persisted cooldown state;
+Headroom preserves each client turn with SSE heartbeats; a route-scoped circuit
+breaker prevents probe storms; and the stack watchdog restores failed processes
+and routing. None of these layers can manufacture provider quota before reset.
 
 Files:
 - `headroom/proxy/upstream_cooldown.py`
@@ -434,8 +447,12 @@ Required proof:
   cap.
 - 429 -> 429 -> 200 produces pings plus one coherent Anthropic response and no
   client-visible 429.
+- 503 -> short retry exhaustion -> held 200 -> recovery is covered.
+- A transport failure after short retries enters the held stream and recovers
+  without emitting a client connection error.
 - Ten concurrent held requests have a maximum of one in-flight header probe.
 - Deadline, non-retryable error, and client-cancellation paths are covered.
+- Recovery counters return to zero active holds and record the exact outcome.
 - The real Claude CLI accepts ping-before-message-start.
 - The rebuilt container exposes all four `HEADROOM_UPSTREAM_429_*` values and a
   controlled routed 429 -> 200 probe completes without an API error.

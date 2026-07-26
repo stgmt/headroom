@@ -1,4 +1,4 @@
-"""Regression tests for long-lived Claude Code 429 recovery."""
+"""Regression tests for long-lived Claude Code upstream recovery."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from headroom.proxy.upstream_cooldown import (
     CooldownHeldStream,
     UpstreamCooldownPolicy,
     cooldown_delay_seconds,
+    get_upstream_cooldown_gate,
+    should_hold_status,
 )
 
 
@@ -55,7 +57,7 @@ def _response(status: int, *, retry_after: str | None = None) -> httpx.Response:
 
 @dataclass
 class _FakeClient:
-    responses: list[httpx.Response]
+    responses: list[httpx.Response | httpx.TransportError]
     header_delay_seconds: float = 0.0
 
     def __post_init__(self) -> None:
@@ -74,6 +76,8 @@ class _FakeClient:
             if self.header_delay_seconds:
                 await asyncio.sleep(self.header_delay_seconds)
             response = self.responses.pop(0)
+            if isinstance(response, httpx.TransportError):
+                raise response
             response.request = request
             return response
         finally:
@@ -99,6 +103,21 @@ def test_retry_after_is_not_capped_by_ordinary_30_second_backoff() -> None:
     )
 
     assert cooldown_delay_seconds(response, policy, 21600) == 2700
+
+
+def test_recovery_policy_holds_only_configured_transient_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_HOLD_ENABLED", "1")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RECOVERY_HOLD_STATUSES", "429,503,529")
+    policy = UpstreamCooldownPolicy.from_env()
+
+    assert should_hold_status(429, policy)
+    assert should_hold_status(503, policy)
+    assert should_hold_status(529, policy)
+    assert not should_hold_status(400, policy)
+    assert not should_hold_status(401, policy)
+    assert not should_hold_status(502, policy)
 
 
 def _held(
@@ -140,6 +159,27 @@ def test_long_retry_after_stays_sse_and_recovers_without_client_429() -> None:
         assert b"event: message_start" in wire
         assert b"event: message_stop" in wire
         assert b"event: error" not in wire
+
+    asyncio.run(scenario())
+
+
+def test_recovery_metrics_track_holds_recovery_and_transport_failures() -> None:
+    async def scenario() -> None:
+        owner = _Owner()
+        request = httpx.Request("POST", "http://sub2api:8080/v1/messages")
+        client = _FakeClient(
+            [httpx.ConnectError("temporary disconnect", request=request), _response(200)]
+        )
+
+        wire = await _consume(_held(owner, client, request_id="metrics", initial_delay=None))
+        snapshot = get_upstream_cooldown_gate(owner).snapshot()
+
+        assert b"event: message_stop" in wire
+        assert snapshot["active_holds"] == 0
+        assert snapshot["holds_total"] == 1
+        assert snapshot["recoveries_total"] == 1
+        assert snapshot["transport_failures_total"] == 1
+        assert snapshot["timeouts_total"] == 0
 
     asyncio.run(scenario())
 
@@ -273,6 +313,121 @@ def test_anthropic_streaming_handler_turns_initial_429_into_held_200(
         assert b"event: message_stop" in wire
         assert b"event: error" not in wire
         proxy._finalize_stream_response.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_anthropic_streaming_handler_holds_503_after_short_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("fastapi")
+    from headroom.proxy.server import HeadroomProxy
+
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_HOLD_ENABLED", "1")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_MAX_WAIT_SECONDS", "1")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_HEARTBEAT_SECONDS", "0.01")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_DEFAULT_RETRY_SECONDS", "0.01")
+
+    async def scenario() -> None:
+        proxy = object.__new__(HeadroomProxy)
+        client = _FakeClient([_response(503), _response(503), _response(200)])
+        proxy.http_client = client
+        proxy.config = MagicMock(
+            retry_enabled=True,
+            retry_max_attempts=2,
+            retry_base_delay_ms=1,
+            retry_max_delay_ms=1,
+            ccr_inject_tool=False,
+        )
+        proxy.memory_handler = None
+        proxy._parse_sse_usage_from_buffer = MagicMock(return_value=None)
+        proxy._finalize_stream_response = AsyncMock(return_value=None)
+
+        response = await proxy._stream_response(
+            url="http://sub2api:8080/v1/messages",
+            headers={"authorization": "Bearer stable-group-key"},
+            body={
+                "model": "claude-sonnet-5",
+                "max_tokens": 32,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-5",
+            request_id="handler-503-hold",
+            original_tokens=5,
+            optimized_tokens=5,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        wire = b"".join([chunk async for chunk in response.body_iterator])
+        assert response.status_code == 200
+        assert client.calls == 3
+        assert b"event: ping" in wire
+        assert b"event: message_stop" in wire
+        assert b"event: error" not in wire
+
+    asyncio.run(scenario())
+
+
+def test_anthropic_streaming_handler_holds_after_transport_retries_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("fastapi")
+    from headroom.proxy.server import HeadroomProxy
+
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_HOLD_ENABLED", "1")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_MAX_WAIT_SECONDS", "1")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_HEARTBEAT_SECONDS", "0.01")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_DEFAULT_RETRY_SECONDS", "0.01")
+
+    async def scenario() -> None:
+        proxy = object.__new__(HeadroomProxy)
+        request = httpx.Request("POST", "http://sub2api:8080/v1/messages")
+        client = _FakeClient(
+            [httpx.ConnectError("stack restarting", request=request), _response(200)]
+        )
+        proxy.http_client = client
+        proxy.config = MagicMock(
+            retry_enabled=True,
+            retry_max_attempts=1,
+            retry_base_delay_ms=1,
+            retry_max_delay_ms=1,
+            ccr_inject_tool=False,
+        )
+        proxy.memory_handler = None
+        proxy._parse_sse_usage_from_buffer = MagicMock(return_value=None)
+        proxy._finalize_stream_response = AsyncMock(return_value=None)
+
+        response = await proxy._stream_response(
+            url="http://sub2api:8080/v1/messages",
+            headers={"authorization": "Bearer stable-group-key"},
+            body={
+                "model": "claude-sonnet-5",
+                "max_tokens": 32,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-5",
+            request_id="handler-transport-hold",
+            original_tokens=5,
+            optimized_tokens=5,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        wire = b"".join([chunk async for chunk in response.body_iterator])
+        assert response.status_code == 200
+        assert client.calls == 2
+        assert b"event: ping" in wire
+        assert b"event: message_stop" in wire
+        assert b"event: error" not in wire
 
     asyncio.run(scenario())
 

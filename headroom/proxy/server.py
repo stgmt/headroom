@@ -165,6 +165,10 @@ from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
+from headroom.proxy.upstream_cooldown import (
+    UpstreamCooldownPolicy,
+    get_upstream_cooldown_gate,
+)
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -2344,6 +2348,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _comp_run_total = proxy._compression_run_seconds_total
             _comp_run_max = proxy._compression_run_seconds_max
             _comp_leaked = proxy._compression_leaked_threads
+        recovery_policy = UpstreamCooldownPolicy.from_env()
+        recovery_snapshot = get_upstream_cooldown_gate(proxy).snapshot()
         return {
             "anthropic_pre_upstream": {
                 "enabled": proxy.anthropic_pre_upstream_sem is not None,
@@ -2376,6 +2382,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "websocket_sessions": {
                 "active_sessions": ws_active_sessions,
                 "active_relay_tasks": ws_active_relay_tasks,
+            },
+            "upstream_recovery": {
+                "enabled": recovery_policy.enabled,
+                "max_wait_seconds": recovery_policy.max_wait_seconds,
+                "heartbeat_seconds": recovery_policy.heartbeat_seconds,
+                "default_retry_seconds": recovery_policy.default_retry_seconds,
+                "hold_statuses": sorted(recovery_policy.hold_statuses),
+                **recovery_snapshot,
             },
         }
 

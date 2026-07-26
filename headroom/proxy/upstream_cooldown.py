@@ -1,9 +1,11 @@
-"""Long-lived streaming recovery for upstream subscription cooldowns.
+"""Long-lived streaming recovery for transient upstream unavailability.
 
 Claude Code treats an HTTP 429 as a failed agent turn.  A subscription reset can
 be tens of minutes away, so a handful of ordinary retries is not enough.  This
 module keeps the Anthropic SSE connection alive with protocol-valid ping events,
 waits for Retry-After, and serializes probe requests across all affected callers.
+The same held-stream path also survives bounded gateway outages and transport
+disconnects without hiding non-retryable request or authentication errors.
 """
 
 from __future__ import annotations
@@ -43,14 +45,30 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     return max(minimum, value)
 
 
+def _env_statuses(name: str, default: frozenset[int]) -> frozenset[int]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    statuses: set[int] = set()
+    for value in raw.split(","):
+        try:
+            status = int(value.strip())
+        except ValueError:
+            continue
+        if 400 <= status <= 599:
+            statuses.add(status)
+    return frozenset(statuses) or default
+
+
 @dataclass(frozen=True)
 class UpstreamCooldownPolicy:
-    """Runtime policy for the streaming 429 hold path."""
+    """Runtime policy for the streaming upstream-recovery hold path."""
 
     enabled: bool
     max_wait_seconds: float
     heartbeat_seconds: float
     default_retry_seconds: float
+    hold_statuses: frozenset[int] = frozenset({429, 502, 503, 504, 529})
 
     @classmethod
     def from_env(cls) -> UpstreamCooldownPolicy:
@@ -65,6 +83,10 @@ class UpstreamCooldownPolicy:
             default_retry_seconds=_env_float(
                 "HEADROOM_UPSTREAM_429_DEFAULT_RETRY_SECONDS", 30.0, minimum=0.05
             ),
+            hold_statuses=_env_statuses(
+                "HEADROOM_UPSTREAM_RECOVERY_HOLD_STATUSES",
+                frozenset({429, 502, 503, 504, 529}),
+            ),
         )
 
 
@@ -75,6 +97,12 @@ class UpstreamCooldownGate:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._until: dict[str, float] = {}
         self._probe_locks: dict[str, asyncio.Lock] = {}
+        self._active_holds = 0
+        self._holds_total = 0
+        self._recoveries_total = 0
+        self._timeouts_total = 0
+        self._cancellations_total = 0
+        self._transport_failures_total = 0
 
     def _ensure_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -101,6 +129,38 @@ class UpstreamCooldownGate:
     def probe_lock(self, key: str) -> asyncio.Lock:
         self._ensure_loop()
         return self._probe_locks.setdefault(key, asyncio.Lock())
+
+    def hold_started(self) -> None:
+        self._active_holds += 1
+        self._holds_total += 1
+
+    def hold_finished(self, outcome: str) -> None:
+        self._active_holds = max(0, self._active_holds - 1)
+        if outcome == "recovered":
+            self._recoveries_total += 1
+        elif outcome == "timeout":
+            self._timeouts_total += 1
+        elif outcome == "cancelled":
+            self._cancellations_total += 1
+
+    def record_transport_failure(self) -> None:
+        self._transport_failures_total += 1
+
+    def snapshot(self) -> dict[str, int | float]:
+        self._ensure_loop()
+        now = time.monotonic()
+        remaining = [max(0.0, value - now) for value in self._until.values()]
+        cooling = [value for value in remaining if value > 0]
+        return {
+            "active_holds": self._active_holds,
+            "cooling_routes": len(cooling),
+            "next_probe_seconds": min(cooling) if cooling else 0.0,
+            "holds_total": self._holds_total,
+            "recoveries_total": self._recoveries_total,
+            "timeouts_total": self._timeouts_total,
+            "cancellations_total": self._cancellations_total,
+            "transport_failures_total": self._transport_failures_total,
+        }
 
 
 def get_upstream_cooldown_gate(owner: Any) -> UpstreamCooldownGate:
@@ -138,6 +198,12 @@ def cooldown_delay_seconds(
     return min(max(delay_ms / 1000.0, 0.05), remaining_budget_seconds)
 
 
+def should_hold_status(status_code: int, policy: UpstreamCooldownPolicy) -> bool:
+    """Return whether an HTTP status is safe to replay before response bytes."""
+
+    return policy.enabled and status_code in policy.hold_statuses
+
+
 def _anthropic_error_event(status_code: int, body: bytes, fallback: str) -> bytes:
     error_type = "rate_limit_error" if status_code == 429 else "api_error"
     message = fallback
@@ -169,11 +235,13 @@ class CooldownHeldStream:
         request_id: str,
         policy: UpstreamCooldownPolicy,
         initial_delay_seconds: float | None = None,
+        initial_status_code: int = 429,
     ) -> None:
         self.headers = httpx.Headers(
             {
                 "content-type": "text/event-stream",
                 "x-headroom-upstream-cooldown-hold": "1",
+                "x-headroom-upstream-recovery-hold": "1",
             }
         )
         self._gate = get_upstream_cooldown_gate(owner)
@@ -185,6 +253,7 @@ class CooldownHeldStream:
         self._policy = policy
         self._route_key = upstream_route_key(url, outbound_headers)
         self._initial_delay_seconds = initial_delay_seconds
+        self._initial_status_code = initial_status_code
         self._active_response: httpx.Response | Any | None = None
         self._pending_task: asyncio.Task[Any] | None = None
         self._closed = False
@@ -228,8 +297,12 @@ class CooldownHeldStream:
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
         deadline = time.monotonic() + self._policy.max_wait_seconds
         last_error_body = b""
+        last_error_status = self._initial_status_code
+        outcome = "cancelled"
         if self._initial_delay_seconds is not None:
             self._gate.defer(self._route_key, self._initial_delay_seconds)
+
+        self._gate.hold_started()
 
         logger.warning(
             "[%s] upstream_cooldown_hold_start route=%s max_wait_s=%.0f",
@@ -288,6 +361,7 @@ class CooldownHeldStream:
                     try:
                         response = send_task.result()
                     except httpx.TransportError as error:
+                        self._gate.record_transport_failure()
                         delay = min(
                             self._policy.default_retry_seconds,
                             max(0.0, deadline - time.monotonic()),
@@ -303,7 +377,8 @@ class CooldownHeldStream:
                         )
                         continue
 
-                    if response.status_code in {429, 529}:
+                    if should_hold_status(response.status_code, self._policy):
+                        last_error_status = response.status_code
                         try:
                             last_error_body = await response.aread()
                         except Exception:
@@ -352,14 +427,17 @@ class CooldownHeldStream:
                     self._request_id,
                     self._route_key,
                 )
+                outcome = "recovered"
                 async for chunk in self._active_response.aiter_bytes():
                     yield chunk
                 return
 
+            outcome = "timeout"
             yield _anthropic_error_event(
-                429,
+                last_error_status,
                 last_error_body,
-                "Upstream rate limit did not recover before the configured hold deadline",
+                "Upstream service did not recover before the configured hold deadline",
             )
         finally:
+            self._gate.hold_finished(outcome)
             await self.aclose()

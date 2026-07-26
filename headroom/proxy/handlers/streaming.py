@@ -23,6 +23,7 @@ from headroom.proxy.upstream_cooldown import (
     UpstreamCooldownPolicy,
     cooldown_delay_seconds,
     get_upstream_cooldown_gate,
+    should_hold_status,
     upstream_route_key,
 )
 
@@ -1225,14 +1226,14 @@ class StreamingMixin:
                     # honoring Retry-After — the streaming sibling of the
                     # _retry_request path (#1221); on exhaustion, fall through to
                     # forward the status to the client.
-                    # A 429 with a subscription reset hint is not a short
-                    # transient retry. Keep Claude Code's stream alive and
-                    # resume behind the shared route gate instead of spending
-                    # ten capped sleeps and surfacing the final 429.
+                    # A subscription 429 is not a short transient retry. Other
+                    # configured gateway failures enter the same held stream
+                    # only after the ordinary retry budget is exhausted.
                     if (
-                        upstream_response.status_code == 429
+                        should_hold_status(upstream_response.status_code, cooldown_policy)
                         and self.config.retry_enabled
                         and cooldown_eligible
+                        and (upstream_response.status_code == 429 or attempt >= retry_attempts - 1)
                     ):
                         delay_seconds = cooldown_delay_seconds(
                             upstream_response,
@@ -1242,10 +1243,12 @@ class StreamingMixin:
                         await upstream_response.aclose()
                         cooldown_gate.defer(cooldown_key, delay_seconds)
                         logger.warning(
-                            "[%s] Upstream 429 entering cooldown hold; retrying in %.2fs",
+                            "[%s] Upstream %s entering recovery hold; retrying in %.2fs",
                             request_id,
+                            upstream_response.status_code,
                             delay_seconds,
                         )
+                        hold_status = upstream_response.status_code
                         upstream_response = CooldownHeldStream(
                             owner=self,
                             http_client=self.http_client,
@@ -1254,11 +1257,15 @@ class StreamingMixin:
                             outbound_headers=outbound_headers,
                             request_id=request_id,
                             policy=cooldown_policy,
+                            initial_status_code=hold_status,
                         )
                         break
 
                     if (
-                        upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
+                        (
+                            upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
+                            or should_hold_status(upstream_response.status_code, cooldown_policy)
+                        )
                         and self.config.retry_enabled
                         and attempt < retry_attempts - 1
                     ):
@@ -1286,6 +1293,26 @@ class StreamingMixin:
                 except httpx.TransportError as e:
                     last_connect_error = e
                     if attempt >= retry_attempts - 1:
+                        if cooldown_eligible and self.config.retry_enabled:
+                            logger.warning(
+                                "[%s] Upstream transport retries exhausted; "
+                                "entering recovery hold: %r",
+                                request_id,
+                                e,
+                            )
+                            cooldown_gate.record_transport_failure()
+                            upstream_response = CooldownHeldStream(
+                                owner=self,
+                                http_client=self.http_client,
+                                url=url,
+                                outbound_bytes=outbound_bytes,
+                                outbound_headers=outbound_headers,
+                                request_id=request_id,
+                                policy=cooldown_policy,
+                                initial_delay_seconds=cooldown_policy.default_retry_seconds,
+                                initial_status_code=503,
+                            )
+                            break
                         raise
 
                     delay_with_jitter = jitter_delay_ms(
