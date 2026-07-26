@@ -275,3 +275,65 @@ def test_anthropic_streaming_handler_turns_initial_429_into_held_200(
         proxy._finalize_stream_response.assert_awaited_once()
 
     asyncio.run(scenario())
+
+
+def test_disabling_hold_reproduces_client_visible_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("fastapi")
+    from headroom.proxy.server import HeadroomProxy
+
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_HOLD_ENABLED", "0")
+
+    async def scenario() -> None:
+        proxy = object.__new__(HeadroomProxy)
+        upstream = _response(429, retry_after="2700")
+        client = _FakeClient([upstream])
+        proxy.http_client = client
+        proxy.config = MagicMock(
+            retry_enabled=True,
+            retry_max_attempts=1,
+            retry_base_delay_ms=1,
+            retry_max_delay_ms=1,
+            ccr_inject_tool=False,
+        )
+        proxy.memory_handler = None
+        proxy.metrics = MagicMock()
+        proxy.cost_tracker = MagicMock()
+        proxy.cost_tracker.estimate_cost.return_value = 0.0
+        proxy.stats = {
+            "requests_total": 0,
+            "requests_optimized": 0,
+            "tokens": {"original": 0, "optimized": 0, "saved": 0},
+            "cost": {"total_usd": 0.0, "savings_usd": 0.0},
+            "errors": 0,
+            "active_requests": 0,
+            "requests_per_model": {},
+        }
+        proxy._record_request_outcome = AsyncMock(return_value=None)
+
+        response = await proxy._stream_response(
+            url="http://sub2api:8080/v1/messages",
+            headers={"authorization": "Bearer stable-group-key"},
+            body={
+                "model": "claude-sonnet-5",
+                "max_tokens": 32,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-5",
+            request_id="handler-no-hold",
+            original_tokens=5,
+            optimized_tokens=5,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert response.status_code == 429
+        assert client.calls == 1
+        assert b"upstream 429" in response.body
+
+    asyncio.run(scenario())
