@@ -28,6 +28,7 @@ from headroom.proxy.helpers import retry_after_ms
 logger = logging.getLogger("headroom.proxy")
 
 _PING_EVENT = b'event: ping\ndata: {"type":"ping"}\n\n'
+_JSON_KEEPALIVE = b" \n"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -204,7 +205,7 @@ def should_hold_status(status_code: int, policy: UpstreamCooldownPolicy) -> bool
     return policy.enabled and status_code in policy.hold_statuses
 
 
-def _anthropic_error_event(status_code: int, body: bytes, fallback: str) -> bytes:
+def _anthropic_error_payload(status_code: int, body: bytes, fallback: str) -> dict[str, Any]:
     error_type = "rate_limit_error" if status_code == 429 else "api_error"
     message = fallback
     try:
@@ -215,8 +216,17 @@ def _anthropic_error_event(status_code: int, body: bytes, fallback: str) -> byte
             message = str(source.get("message") or message)
     except (json.JSONDecodeError, UnicodeDecodeError):
         pass
-    payload = {"type": "error", "error": {"type": error_type, "message": message}}
+    return {"type": "error", "error": {"type": error_type, "message": message}}
+
+
+def _anthropic_error_event(status_code: int, body: bytes, fallback: str) -> bytes:
+    payload = _anthropic_error_payload(status_code, body, fallback)
     return f"event: error\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+
+
+def _anthropic_error_json(status_code: int, body: bytes, fallback: str) -> bytes:
+    payload = _anthropic_error_payload(status_code, body, fallback)
+    return json.dumps(payload, separators=(",", ":")).encode()
 
 
 class CooldownHeldStream:
@@ -236,10 +246,13 @@ class CooldownHeldStream:
         policy: UpstreamCooldownPolicy,
         initial_delay_seconds: float | None = None,
         initial_status_code: int = 429,
+        json_mode: bool = False,
     ) -> None:
+        self._json_mode = json_mode
+        content_type = "application/json" if json_mode else "text/event-stream"
         self.headers = httpx.Headers(
             {
-                "content-type": "text/event-stream",
+                "content-type": content_type,
                 "x-headroom-upstream-cooldown-hold": "1",
                 "x-headroom-upstream-recovery-hold": "1",
             }
@@ -258,6 +271,14 @@ class CooldownHeldStream:
         self._pending_task: asyncio.Task[Any] | None = None
         self._closed = False
 
+    def _keepalive(self) -> bytes:
+        return _JSON_KEEPALIVE if self._json_mode else _PING_EVENT
+
+    def _error(self, status_code: int, body: bytes, fallback: str) -> bytes:
+        if self._json_mode:
+            return _anthropic_error_json(status_code, body, fallback)
+        return _anthropic_error_event(status_code, body, fallback)
+
     async def aclose(self) -> None:
         self._closed = True
         if self._pending_task is not None and not self._pending_task.done():
@@ -275,7 +296,7 @@ class CooldownHeldStream:
             remaining = wake_at - time.monotonic()
             if remaining <= 0:
                 return
-            yield _PING_EVENT
+            yield self._keepalive()
             await asyncio.sleep(min(self._policy.heartbeat_seconds, remaining))
 
     async def _wait_task_with_pings(
@@ -292,7 +313,7 @@ class CooldownHeldStream:
                 {task}, timeout=min(self._policy.heartbeat_seconds, remaining)
             )
             if not done:
-                yield _PING_EVENT
+                yield self._keepalive()
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
         deadline = time.monotonic() + self._policy.max_wait_seconds
@@ -403,7 +424,7 @@ class CooldownHeldStream:
                         except Exception:
                             body = b""
                         await response.aclose()
-                        yield _anthropic_error_event(
+                        yield self._error(
                             response.status_code,
                             body,
                             f"Upstream returned HTTP {response.status_code} after cooldown",
@@ -433,7 +454,7 @@ class CooldownHeldStream:
                 return
 
             outcome = "timeout"
-            yield _anthropic_error_event(
+            yield self._error(
                 last_error_status,
                 last_error_body,
                 "Upstream service did not recover before the configured hold deadline",

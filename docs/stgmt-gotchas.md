@@ -415,6 +415,11 @@ Fix:
   ordinary short retries are exhausted.
 - It emits `event: ping`, honors the full `Retry-After`, and retries the exact
   original request after the cooldown.
+- Claude Code also sends buffered `stream:false` turns. Those use an HTTP 200
+  chunked JSON hold: legal leading JSON whitespace is emitted as keepalive,
+  followed by the recovered provider JSON on the same request. Returning SSE
+  for this path is invalid, while returning the original 429 kills compact and
+  fallback probes.
 - All requests for the same upstream URL and hashed credential share one
   cooldown clock and one response-header probe lock. The lock is released as
   soon as a probe receives successful headers, so successful generations may
@@ -432,13 +437,15 @@ Fix:
 This is not just a retry loop. The complete recovery chain is: sub2api persists
 the provider reset; its scheduler automatically admits the account after that
 timestamp; a successful Anthropic response clears persisted cooldown state;
-Headroom preserves each client turn with SSE heartbeats; a route-scoped circuit
-breaker prevents probe storms; and the stack watchdog restores failed processes
-and routing. None of these layers can manufacture provider quota before reset.
+Headroom preserves streaming turns with SSE heartbeats and buffered turns with
+JSON-whitespace keepalives; a route-scoped circuit breaker prevents probe
+storms; and the stack watchdog restores failed processes and routing. None of
+these layers can manufacture provider quota before reset.
 
 Files:
 - `headroom/proxy/upstream_cooldown.py`
 - `headroom/proxy/handlers/streaming.py`
+- `headroom/proxy/handlers/anthropic.py`
 - `tests/test_stgmt_upstream_cooldown_hold.py`
 - paired `stgmt/sub2api` compose, setup, verifier, skill, and eval files
 

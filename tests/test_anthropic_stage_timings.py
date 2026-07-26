@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import anyio
+import httpx
 import pytest
 from fastapi import Request
 
@@ -243,6 +244,97 @@ def test_anthropic_http_happy_path_emits_stage_timings(stage_log_capture):
     path, emitted = handler.metrics.stage_timings[-1]
     assert path == "anthropic_messages"
     assert "total_pre_upstream" in emitted
+
+
+@pytest.mark.parametrize("failure_kind", ["429", "503", "transport"])
+def test_anthropic_buffered_failures_enter_json_recovery_hold(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_HOLD_ENABLED", "1")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_MAX_WAIT_SECONDS", "1")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_HEARTBEAT_SECONDS", "0.01")
+    monkeypatch.setenv("HEADROOM_UPSTREAM_429_DEFAULT_RETRY_SECONDS", "0.01")
+
+    async def scenario() -> None:
+        request = _build_request(
+            {
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+            {"authorization": "Bearer stable-group-key"},
+        )
+        handler = _DummyAnthropicHandler()
+        upstream_request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        initial = httpx.Response(
+            429,
+            request=upstream_request,
+            headers={"retry-after": "0.01", "content-type": "application/json"},
+            json={
+                "type": "error",
+                "error": {"type": "rate_limit_error", "message": "provider reset"},
+            },
+        )
+
+        async def initial_retry(*args, **kwargs):
+            if failure_kind == "429":
+                return initial
+            if failure_kind == "503":
+                response = httpx.Response(
+                    503,
+                    request=upstream_request,
+                    headers={"retry-after": "0.01"},
+                    json={"type": "error", "error": {"message": "overloaded"}},
+                )
+                raise httpx.HTTPStatusError(
+                    "overloaded",
+                    request=upstream_request,
+                    response=response,
+                )
+            raise httpx.ConnectError("stack restarting", request=upstream_request)
+
+        calls = 0
+
+        async def recovered(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "id": "msg_recovered",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "BUFFERED_RECOVERY_OK"}],
+                    "model": "claude-opus-5",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+        handler._retry_request = initial_retry  # type: ignore[method-assign]
+        handler.http_client = httpx.AsyncClient(transport=httpx.MockTransport(recovered))
+
+        import headroom.tokenizers as _tk
+
+        orig_get = _tk.get_tokenizer
+        _tk.get_tokenizer = lambda model: _DummyTokenizer()
+        try:
+            response = await handler.handle_anthropic_messages(request)
+            wire = b"".join([chunk async for chunk in response.body_iterator])
+        finally:
+            _tk.get_tokenizer = orig_get
+            await handler.http_client.aclose()
+
+        payload = json.loads(wire)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+        assert wire.startswith(b" \n")
+        assert calls == 1
+        assert payload["content"][0]["text"] == "BUFFERED_RECOVERY_OK"
+
+    anyio.run(scenario)
 
 
 def test_anthropic_no_optimize_preserves_client_tool_order():

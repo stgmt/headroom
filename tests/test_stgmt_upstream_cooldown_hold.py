@@ -55,6 +55,28 @@ def _response(status: int, *, retry_after: str | None = None) -> httpx.Response:
     return httpx.Response(status, headers=headers, stream=_BytesStream(chunks))
 
 
+def _json_response(status: int, *, retry_after: str | None = None) -> httpx.Response:
+    headers = {"content-type": "application/json"}
+    if retry_after is not None:
+        headers["retry-after"] = retry_after
+    if status >= 400:
+        payload = {
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": f"upstream {status}"},
+        }
+    else:
+        payload = {
+            "id": "msg_json_ok",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "JSON_RECOVERY_OK"}],
+            "model": "claude-sonnet-5",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+    return httpx.Response(status, headers=headers, content=json.dumps(payload).encode())
+
+
 @dataclass
 class _FakeClient:
     responses: list[httpx.Response | httpx.TransportError]
@@ -159,6 +181,33 @@ def test_long_retry_after_stays_sse_and_recovers_without_client_429() -> None:
         assert b"event: message_start" in wire
         assert b"event: message_stop" in wire
         assert b"event: error" not in wire
+
+    asyncio.run(scenario())
+
+
+def test_buffered_json_hold_uses_whitespace_keepalive_then_valid_json() -> None:
+    async def scenario() -> None:
+        owner = _Owner()
+        client = _FakeClient([_json_response(429, retry_after="0.02"), _json_response(200)])
+        held = CooldownHeldStream(
+            owner=owner,
+            http_client=client,  # type: ignore[arg-type]
+            url="http://sub2api:8080/v1/messages",
+            outbound_bytes=b'{"stream":false}',
+            outbound_headers={"authorization": "Bearer stable-group-key"},
+            request_id="json-recover",
+            policy=_policy(),
+            initial_delay_seconds=0.01,
+            json_mode=True,
+        )
+
+        wire = await _consume(held)
+        payload = json.loads(wire)
+
+        assert client.calls == 2
+        assert wire.startswith(b" \n")
+        assert b"event: ping" not in wire
+        assert payload["content"][0]["text"] == "JSON_RECOVERY_OK"
 
     asyncio.run(scenario())
 

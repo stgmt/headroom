@@ -34,6 +34,13 @@ from headroom.proxy.helpers import extract_tags
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.upstream_cooldown import (
+    CooldownHeldStream,
+    UpstreamCooldownPolicy,
+    cooldown_delay_seconds,
+    get_upstream_cooldown_gate,
+    should_hold_status,
+)
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -2702,6 +2709,51 @@ class AnthropicHandlerMixin:
             if upstream_base_url and request.url.query:
                 url = f"{url}?{request.url.query}"
 
+            recovery_policy = UpstreamCooldownPolicy.from_env()
+
+            async def _buffered_recovery_hold(
+                initial_status: int,
+                delay_seconds: float,
+            ) -> StreamingResponse:
+                from starlette.background import BackgroundTask
+
+                assert self.http_client is not None
+                replay_headers = {
+                    key: value
+                    for key, value in headers.items()
+                    if key.lower() not in {"content-length", "transfer-encoding"}
+                }
+                replay_headers["content-type"] = "application/json"
+                replay_body = json.dumps(
+                    body,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                held_response = CooldownHeldStream(
+                    owner=self,
+                    http_client=self.http_client,
+                    url=url,
+                    outbound_bytes=replay_body,
+                    outbound_headers=replay_headers,
+                    request_id=request_id,
+                    policy=recovery_policy,
+                    initial_delay_seconds=delay_seconds,
+                    initial_status_code=initial_status,
+                    json_mode=True,
+                )
+                logger.warning(
+                    "[%s] Buffered upstream %s entering JSON recovery hold; retrying in %.2fs",
+                    request_id,
+                    initial_status,
+                    delay_seconds,
+                )
+                return StreamingResponse(
+                    held_response.aiter_bytes(),
+                    status_code=200,
+                    headers=dict(held_response.headers),
+                    background=BackgroundTask(held_response.aclose),
+                )
+
             try:
                 ccr_handler_config = getattr(self.ccr_response_handler, "config", None)
                 ccr_response_handler_enabled = bool(
@@ -2781,20 +2833,42 @@ class AnthropicHandlerMixin:
                         session_key=session_key,
                     )
                 else:
-                    async with stage_timer.measure("upstream_connect"):
-                        response = await self._retry_request(
-                            "POST",
-                            url,
-                            headers,
-                            body,
-                            original_body_bytes=original_body_bytes,
-                            body_mutated=body_mutation_tracker.mutated,
-                            mutation_reasons=body_mutation_tracker.reasons,
-                            request_id=request_id,
-                            forwarder_name="anthropic_messages",
-                            path_for_log="/v1/messages",
-                            timeout=self._anthropic_buffered_request_timeout(),
+                    try:
+                        async with stage_timer.measure("upstream_connect"):
+                            response = await self._retry_request(
+                                "POST",
+                                url,
+                                headers,
+                                body,
+                                original_body_bytes=original_body_bytes,
+                                body_mutated=body_mutation_tracker.mutated,
+                                mutation_reasons=body_mutation_tracker.reasons,
+                                request_id=request_id,
+                                forwarder_name="anthropic_messages",
+                                path_for_log="/v1/messages",
+                                timeout=self._anthropic_buffered_request_timeout(),
+                            )
+                    except httpx.TransportError:
+                        if not recovery_policy.enabled:
+                            raise
+                        get_upstream_cooldown_gate(self).record_transport_failure()
+                        await _finalize_pre_upstream()
+                        return await _buffered_recovery_hold(
+                            503,
+                            recovery_policy.default_retry_seconds,
                         )
+                    except httpx.HTTPStatusError as error:
+                        status = error.response.status_code
+                        if not should_hold_status(status, recovery_policy):
+                            raise
+                        delay_seconds = cooldown_delay_seconds(
+                            error.response,
+                            recovery_policy,
+                            recovery_policy.max_wait_seconds,
+                        )
+                        await error.response.aclose()
+                        await _finalize_pre_upstream()
+                        return await _buffered_recovery_hold(status, delay_seconds)
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
                         operation="proxy.request",
@@ -2836,6 +2910,21 @@ class AnthropicHandlerMixin:
                             stage_timer.summary()["upstream_connect"],
                         )
                     await _finalize_pre_upstream()
+                    # Claude Code also issues buffered ``stream:false`` turns
+                    # (notably compact and fallback probes). Returning a raw
+                    # provider 429 terminates those turns, while an SSE ping is
+                    # not valid for a JSON response. Keep the HTTP/1.1 body
+                    # alive with legal leading JSON whitespace, then append the
+                    # recovered upstream JSON on the same request.
+                    if should_hold_status(response.status_code, recovery_policy):
+                        delay_seconds = cooldown_delay_seconds(
+                            response,
+                            recovery_policy,
+                            recovery_policy.max_wait_seconds,
+                        )
+                        initial_status = response.status_code
+                        await response.aclose()
+                        return await _buffered_recovery_hold(initial_status, delay_seconds)
                     # Full diagnostic dump on upstream errors.
                     # Writes pre/post compression messages, tools, and error
                     # to ~/.headroom/logs/debug_400/ for offline analysis.
