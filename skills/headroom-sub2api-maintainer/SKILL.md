@@ -26,6 +26,7 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 - Claude Code stream keys must include both `x-claude-code-session-id` and `x-claude-code-agent-id` unless an explicit `x-headroom-session-id` is provided.
 - A server-side memory continuation must include only `tool_use` blocks with matching Headroom-produced `tool_result` IDs. Defer client-owned calls and remove private `memory_*` definitions from the continuation; replaying a mixed turn creates OpenAI Responses `400 No tool output found for function call call_*` errors.
 - Handler watchdog timeout must cancel the primary handler and retry once through Headroom bypass/passthrough before any 504 leaves the proxy.
+- A native subscription `429` with `Retry-After` must not terminate a Claude Code streaming turn. When `HEADROOM_UPSTREAM_429_HOLD_ENABLED=1`, return a held HTTP 200 SSE stream, emit protocol-valid `ping` events while waiting, honor the full reset delay up to `HEADROOM_UPSTREAM_429_MAX_WAIT_SECONDS`, and serialize response-header probes per upstream route/credential. Do not apply this hold to non-retryable `400/401` errors, and do not silently enable another provider.
 - `--embedding-server` must use `headroom.memory.adapters.watchdog.SocketEmbedderClient` when `HEADROOM_EMBEDDING_SERVER_SOCKET` is set; silent per-worker fallback is a regression unless the sidecar import/start is deliberately forced to fail by a test.
 - The Docker image must build Headroom from `HEADROOM_GIT_REPO=https://github.com/stgmt/headroom.git` at pinned `HEADROOM_GIT_REF`, not only from the public PyPI wheel. Keep `HEADROOM_RUST_TOOLCHAIN=1.88.0`; Debian's older Rust has failed the fork build.
 - Preserve runtime `.env` secrets and user OAuth/account state. Never regenerate or print secrets just to repair compose/docs. If `REDIS_PASSWORD` is empty, generate one, then recreate Redis and sub2api consistently without exposing the value.
@@ -53,6 +54,7 @@ Run after Headroom source changes:
 ```powershell
 python -m py_compile headroom/proxy/handlers/anthropic.py headroom/proxy/handlers/streaming.py headroom/memory/adapters/watchdog.py headroom/memory/factory.py
 python -m pytest tests/test_stgmt_claude_code_recovery.py tests/test_cli_proxy_embedding_server.py tests/test_mid_turn_steering.py tests/test_anthropic_memory_mixed_tools.py
+python -m pytest tests/test_stgmt_upstream_cooldown_hold.py
 ```
 
 Run after Docker/runtime changes in `sub2api`:

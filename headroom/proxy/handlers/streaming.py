@@ -18,6 +18,13 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
     retry_after_ms,
 )
+from headroom.proxy.upstream_cooldown import (
+    CooldownHeldStream,
+    UpstreamCooldownPolicy,
+    cooldown_delay_seconds,
+    get_upstream_cooldown_gate,
+    upstream_route_key,
+)
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -99,9 +106,7 @@ class StreamingMixin:
 
     # sub2api downstream Claude Code overlap wait patch
     def _mark_mid_turn_stream_active(self, session_key: str) -> None:
-        self._active_stream_counts[session_key] = (
-            self._active_stream_counts.get(session_key, 0) + 1
-        )
+        self._active_stream_counts[session_key] = self._active_stream_counts.get(session_key, 0) + 1
         self._active_streams.add(session_key)
 
     async def _wait_for_mid_turn_stream(self, session_key: str, request_id: str) -> float:
@@ -1180,8 +1185,26 @@ class StreamingMixin:
             retry_attempts = max(1, getattr(self.config, "retry_max_attempts", 3))
             upstream_response = None
             last_connect_error = None
+            cooldown_policy = UpstreamCooldownPolicy.from_env()
+            cooldown_eligible = cooldown_policy.enabled and provider == "anthropic"
+            cooldown_gate = get_upstream_cooldown_gate(self)
+            cooldown_key = upstream_route_key(url, outbound_headers)
 
-            for attempt in range(retry_attempts):
+            # Do not hammer sub2api again when another Claude request already
+            # discovered a subscription cooldown. The held stream emits Anthropic
+            # ping events immediately, then joins the shared single-probe gate.
+            if cooldown_eligible and cooldown_gate.remaining(cooldown_key) > 0:
+                upstream_response = CooldownHeldStream(
+                    owner=self,
+                    http_client=self.http_client,
+                    url=url,
+                    outbound_bytes=outbound_bytes,
+                    outbound_headers=outbound_headers,
+                    request_id=request_id,
+                    policy=cooldown_policy,
+                )
+
+            for attempt in range(retry_attempts) if upstream_response is None else ():
                 try:
                     _upstream_req = self.http_client.build_request(
                         "POST", url, content=outbound_bytes, headers=outbound_headers
@@ -1202,6 +1225,38 @@ class StreamingMixin:
                     # honoring Retry-After — the streaming sibling of the
                     # _retry_request path (#1221); on exhaustion, fall through to
                     # forward the status to the client.
+                    # A 429 with a subscription reset hint is not a short
+                    # transient retry. Keep Claude Code's stream alive and
+                    # resume behind the shared route gate instead of spending
+                    # ten capped sleeps and surfacing the final 429.
+                    if (
+                        upstream_response.status_code == 429
+                        and self.config.retry_enabled
+                        and cooldown_eligible
+                    ):
+                        delay_seconds = cooldown_delay_seconds(
+                            upstream_response,
+                            cooldown_policy,
+                            cooldown_policy.max_wait_seconds,
+                        )
+                        await upstream_response.aclose()
+                        cooldown_gate.defer(cooldown_key, delay_seconds)
+                        logger.warning(
+                            "[%s] Upstream 429 entering cooldown hold; retrying in %.2fs",
+                            request_id,
+                            delay_seconds,
+                        )
+                        upstream_response = CooldownHeldStream(
+                            owner=self,
+                            http_client=self.http_client,
+                            url=url,
+                            outbound_bytes=outbound_bytes,
+                            outbound_headers=outbound_headers,
+                            request_id=request_id,
+                            policy=cooldown_policy,
+                        )
+                        break
+
                     if (
                         upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
                         and self.config.retry_enabled

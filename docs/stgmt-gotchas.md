@@ -389,3 +389,53 @@ When this fork changes a behavior used by the sub2api Docker profile, update the
 - local installed skill at `%USERPROFILE%\.codex\skills\sub2api-claude-code-codex`
 
 Do not claim a Headroom fix is active until the running `headroom-sub2api` container proves it.
+## 2026-07-26: Short 429 retries killed agents during subscription cooldowns
+
+Problem:
+A real Anthropic subscription-window 429 made sub2api mark the only account in
+the `anthropic-only` group unavailable until its provider reset. The original
+Headroom retry loop allowed at most ten attempts and capped every
+`Retry-After` sleep at 30 seconds, so it could cover only a few minutes. A
+45-minute reset produced a burst of generic `No available accounts` responses,
+and Claude Code terminated every affected main/subagent turn.
+
+Mechanism:
+- Retrying the request immediately cannot remove a real provider cooldown.
+- Returning the accurate 429 is still destructive to Claude Code autonomy.
+- Letting every waiting agent probe independently creates a retry storm at the
+  reset boundary.
+- Anthropic's streaming protocol permits any number of `ping` events. A live
+  Claude Code 2.1.219 probe accepted three ping events before `message_start`
+  and completed normally.
+
+Fix:
+- `CooldownHeldStream` converts an eligible streaming 429 into an HTTP 200 SSE
+  hold before the error reaches Claude Code.
+- It emits `event: ping`, honors the full `Retry-After`, and retries the exact
+  original request after the cooldown.
+- All requests for the same upstream URL and hashed credential share one
+  cooldown clock and one response-header probe lock. The lock is released as
+  soon as a probe receives successful headers, so successful generations may
+  stream concurrently without a thundering herd of 429 probes.
+- Cancellation closes the active upstream response, cancels pending probe work,
+  and releases the probe slot.
+- `400/401` and other non-retryable errors remain visible. The default paired
+  profile holds for at most six hours; it never enables GPT/Qwen fallback in
+  `anthropic-only`.
+
+Files:
+- `headroom/proxy/upstream_cooldown.py`
+- `headroom/proxy/handlers/streaming.py`
+- `tests/test_stgmt_upstream_cooldown_hold.py`
+- paired `stgmt/sub2api` compose, setup, verifier, skill, and eval files
+
+Required proof:
+- A 2700-second `Retry-After` is not truncated to the ordinary 30-second retry
+  cap.
+- 429 -> 429 -> 200 produces pings plus one coherent Anthropic response and no
+  client-visible 429.
+- Ten concurrent held requests have a maximum of one in-flight header probe.
+- Deadline, non-retryable error, and client-cancellation paths are covered.
+- The real Claude CLI accepts ping-before-message-start.
+- The rebuilt container exposes all four `HEADROOM_UPSTREAM_429_*` values and a
+  controlled routed 429 -> 200 probe completes without an API error.
