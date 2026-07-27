@@ -23,6 +23,7 @@ Use this skill when work touches `stgmt/headroom`, the `headroom-sub2api` Docker
 
 - Claude Code must not receive Headroom's private HTTP 202 `headroom_queued` response for streaming `/v1/messages`.
 - Native Claude Code compact requests must retain their exact final compact message after Headroom transforms, must carry `x-sub2api-claude-compact: 1` downstream, and must skip output shaping. Otherwise sub2api sees an ordinary Sol request and compact routing silently stays on Sol.
+- User, system, and developer instructions are authoritative and must remain byte-exact in the paired Claude Code profile. `agent-90` may compress large tool/output material but must keep `compress_user_messages=false` and `compress_system_messages=false`; `protect_recent` is not a substitute because it only protects code-like content.
 - Claude Code stream keys must include both `x-claude-code-session-id` and `x-claude-code-agent-id` unless an explicit `x-headroom-session-id` is provided.
 - A server-side memory continuation must include only `tool_use` blocks with matching Headroom-produced `tool_result` IDs. Defer client-owned calls and remove private `memory_*` definitions from the continuation; replaying a mixed turn creates OpenAI Responses `400 No tool output found for function call call_*` errors.
 - Handler watchdog timeout must cancel the primary handler and retry once through Headroom bypass/passthrough before any 504 leaves the proxy.
@@ -96,7 +97,7 @@ Expected runtime marker:
 Expected mixed-memory marker:
 `Memory: Deferred 1 client-owned tool call(s) from continuation: ['Bash']`
 
-For native compact routing, the installed handler must contain `_is_claude_code_compact_request`, `x-sub2api-claude-compact`, and `headroom:claude_code_compact_prompt_preserved`. A real forked Claude Code `/compact`, not only a synthetic probe, must produce that transform marker in `proxy-requests.jsonl` and a Spark/Luna compact route in sub2api `usage_logs`.
+For native compact routing, the installed handler must contain `_is_claude_code_compact_request`, `x-sub2api-claude-compact`, and `headroom:claude_code_compact_prompt_preserved`. A real forked Claude Code `/compact`, not only a synthetic probe, must produce that transform marker in `proxy-requests.jsonl` and a Terra-medium/medium compact route in sub2api `usage_logs`. A tool or skill payload that merely mentions compaction must remain on the selected main route.
 
 For durable stats, capture `/stats.request_history`, recreate Headroom, and
 require the same request total, first/last timestamps, token totals, and

@@ -39,8 +39,8 @@ def test_agent_90_profile_sets_accuracy_preserving_compress_config() -> None:
 
     apply_agent_savings_profile(cfg, AGENT_90_PROFILE)
 
-    assert cfg.compress_user_messages is True
-    assert cfg.compress_system_messages is True
+    assert cfg.compress_user_messages is False
+    assert cfg.compress_system_messages is False
     assert cfg.protect_recent == 2
     assert cfg.protect_analysis_context is True
     assert cfg.target_ratio == 0.10
@@ -56,8 +56,8 @@ def test_agent_90_profile_exports_cross_agent_proxy_env() -> None:
     assert env["HEADROOM_SAVINGS_PROFILE"] == "agent-90"
     assert env["HEADROOM_SAVINGS_TARGET"] == "0.90"
     assert env["HEADROOM_TARGET_RATIO"] == "0.10"
-    assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "1"
-    assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "1"
+    assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "0"
+    assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "0"
     assert env["HEADROOM_MAX_ITEMS"] == "8"
     assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
     assert env["HEADROOM_FORCE_KOMPRESS"] == "1"
@@ -202,8 +202,8 @@ def test_compress_applies_agent_savings_profile_to_pipeline(monkeypatch) -> None
     result = compress(messages, config=config)
 
     assert result.compression_ratio == 0.9
-    assert captured["compress_user_messages"] is True
-    assert captured["compress_system_messages"] is True
+    assert captured["compress_user_messages"] is False
+    assert captured["compress_system_messages"] is False
     assert captured["protect_recent"] == 2
     assert captured["protect_analysis_context"] is True
     assert captured["target_ratio"] == 0.10
@@ -341,8 +341,8 @@ def test_agent_savings_config_mismatches_accepts_matching_runtime_config(monkeyp
     running_config = {
         "savings_profile": profile.name,
         "target_ratio": "0.10",
-        "compress_user_messages": True,
-        "compress_system_messages": True,
+        "compress_user_messages": False,
+        "compress_system_messages": False,
         "protect_recent": "2",
         "protect_analysis_context": True,
         "min_tokens_to_crush": "120",
@@ -388,8 +388,8 @@ def test_agent_90_profile_applies_to_proxy_config_runtime_kwargs() -> None:
 
     kwargs = proxy_pipeline_kwargs(config)
 
-    assert kwargs["compress_user_messages"] is True
-    assert kwargs["compress_system_messages"] is True
+    assert kwargs["compress_user_messages"] is False
+    assert kwargs["compress_system_messages"] is False
     assert kwargs["protect_recent"] == 2
     assert kwargs["protect_analysis_context"] is True
     assert kwargs["target_ratio"] == 0.10
@@ -486,6 +486,56 @@ def test_agent_90_router_json_tool_output_reaches_target_with_needle() -> None:
     assert 1 - after / before >= 0.90
     assert needle in result.compressed
     assert "<<ccr:" in result.compressed
+
+
+def test_agent_90_preserves_incident_user_task_but_still_compresses_tool_output() -> None:
+    class Tokenizer:
+        def count_text(self, text: str) -> int:
+            return max(1, len(text.split()))
+
+    cfg = CompressConfig()
+    apply_agent_savings_profile(cfg, AGENT_90_PROFILE)
+    router = ContentRouter()
+    compressed_inputs: list[str] = []
+
+    def fake_compress(text: str, **kwargs: object) -> SimpleNamespace:
+        compressed_inputs.append(text)
+        return SimpleNamespace(
+            compressed="COMPRESSED <<ccr:incident-tool>>",
+            compression_ratio=0.1,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = fake_compress  # type: ignore[method-assign]
+    task_suffix = (
+        "Я хочу понять, какую модель использовать для этой задачи. "
+        "Погугли актуальные варианты и дай сравнительную аналитику."
+    )
+    incident_prompt = (
+        ("Billing field: amount=123; currency=USD; status=paid. " * 30)
+        + task_suffix
+    )
+    tool_output = "Context compaction documentation and telemetry. " * 150
+
+    result = router.apply(
+        [
+            {"role": "system", "content": "Do not drop the user's requested task. " * 30},
+            {"role": "user", "content": incident_prompt},
+            {"role": "tool", "tool_call_id": "call_skill", "content": tool_output},
+        ],
+        Tokenizer(),
+        compress_user_messages=cfg.compress_user_messages,
+        compress_system_messages=cfg.compress_system_messages,
+        protect_recent=cfg.protect_recent,
+        protect_analysis_context=cfg.protect_analysis_context,
+        min_tokens_to_compress=cfg.min_tokens_to_compress,
+    )
+
+    assert result.messages[0]["content"] == "Do not drop the user's requested task. " * 30
+    assert result.messages[1]["content"] == incident_prompt
+    assert result.messages[1]["content"].endswith(task_suffix)
+    assert result.messages[2]["content"] == "COMPRESSED <<ccr:incident-tool>>"
+    assert compressed_inputs == [tool_output]
 
 
 def test_proxy_cli_reads_agent_90_profile_env() -> None:

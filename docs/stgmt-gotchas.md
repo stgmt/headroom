@@ -499,3 +499,31 @@ Required proof:
 - A successful buffered Sol response clears a stale Sol circuit.
 - Existing recovery, cancellation, deadline, transport, and streaming suites
   remain green after the key change.
+
+## 2026-07-27: Agent-90 deleted the task while preserving incidental fields
+
+Problem:
+The `agent-90` profile enabled lossy Kompress for user and system messages. A
+real Claude Code request retained repeated billing fields but lost the final
+natural-language task. Re-sending the same text as a screenshot worked because
+the task no longer passed through text compression.
+
+Mechanism:
+`compress_user_messages=True` and `compress_system_messages=True` bypassed the
+router's instruction-role protection. `protect_recent=2` did not help because
+it protects recent code-like content, not ordinary prose instructions.
+
+Fix:
+- Set both instruction compression flags to false in `agent-90` and in the
+  paired sub2api compose/setup defaults.
+- Keep user, system, and developer instructions byte-exact.
+- Continue compressing large tool outputs so the savings path remains active.
+- Let Headroom's pre-transform native compact detector send the trusted
+  `x-sub2api-claude-compact: 1` header; downstream routing must never scan text.
+
+Required proof:
+- An incident-shaped prompt retains its full task suffix byte-for-byte.
+- The same pipeline still compresses a large tool result.
+- Re-enabling either instruction compression flag makes the regression fail.
+- The live container reports both compression flags as zero and a real text
+  turn remains semantically equivalent to the screenshot control.

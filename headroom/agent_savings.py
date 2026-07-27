@@ -112,8 +112,12 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         name=AGENT_90_PROFILE,
         target_savings=0.90,
         target_ratio=0.10,
-        compress_user_messages=True,
-        compress_system_messages=True,
+        # User and system turns are authoritative instructions. Lossy
+        # compression here can preserve incidental structured fields while
+        # deleting the actual task, so agent-90 only compresses tool/output
+        # material and other non-instruction roles.
+        compress_user_messages=False,
+        compress_system_messages=False,
         protect_recent=2,
         protect_analysis_context=True,
         min_tokens_to_compress=120,
