@@ -174,15 +174,21 @@ def get_upstream_cooldown_gate(owner: Any) -> UpstreamCooldownGate:
     return gate
 
 
-def upstream_route_key(url: str, headers: dict[str, str]) -> str:
-    """Scope cooldowns to an upstream endpoint and credential without logging it."""
+def upstream_route_key(
+    url: str,
+    headers: dict[str, str],
+    *,
+    model: str | None = None,
+) -> str:
+    """Scope cooldowns to one upstream endpoint, credential, and model."""
 
     credential = ""
     for name, value in headers.items():
         if name.lower() in {"authorization", "x-api-key"}:
             credential = value
             break
-    return hashlib.sha256(f"{url}\0{credential}".encode()).hexdigest()[:20]
+    model_scope = (model or "").strip().lower()
+    return hashlib.sha256(f"{url}\0{credential}\0{model_scope}".encode()).hexdigest()[:20]
 
 
 def cooldown_delay_seconds(
@@ -244,6 +250,7 @@ class CooldownHeldStream:
         outbound_headers: dict[str, str],
         request_id: str,
         policy: UpstreamCooldownPolicy,
+        model: str | None = None,
         initial_delay_seconds: float | None = None,
         initial_status_code: int = 429,
         json_mode: bool = False,
@@ -264,7 +271,7 @@ class CooldownHeldStream:
         self._outbound_headers = outbound_headers
         self._request_id = request_id
         self._policy = policy
-        self._route_key = upstream_route_key(url, outbound_headers)
+        self._route_key = upstream_route_key(url, outbound_headers, model=model)
         self._initial_delay_seconds = initial_delay_seconds
         self._initial_status_code = initial_status_code
         self._active_response: httpx.Response | Any | None = None

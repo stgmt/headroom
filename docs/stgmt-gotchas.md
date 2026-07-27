@@ -420,10 +420,12 @@ Fix:
   followed by the recovered provider JSON on the same request. Returning SSE
   for this path is invalid, while returning the original 429 kills compact and
   fallback probes.
-- All requests for the same upstream URL and hashed credential share one
-  cooldown clock and one response-header probe lock. The lock is released as
-  soon as a probe receives successful headers, so successful generations may
-  stream concurrently without a thundering herd of 429 probes.
+- Requests for the same upstream URL, hashed credential, and requested model
+  share one cooldown clock and one response-header probe lock. Different
+  models remain isolated even when sub2api exposes them through one stable key.
+  Any successful streaming or buffered response clears only its matching model
+  circuit, so successful generations may resume without a thundering herd of
+  429 probes.
 - Cancellation closes the active upstream response, cancels pending probe work,
   and releases the probe slot.
 - `400/401` and other non-retryable errors remain visible. The default paired
@@ -463,3 +465,37 @@ Required proof:
 - The real Claude CLI accepts ping-before-message-start.
 - The rebuilt container exposes all four `HEADROOM_UPSTREAM_429_*` values and a
   controlled routed 429 -> 200 probe completes without an API error.
+
+## 2026-07-27: One model cooldown poisoned every stable-key route
+
+Problem:
+Headroom originally hashed only the upstream URL and stable sub2api credential
+for its recovery circuit. A `claude-sonnet-5` 429 with a six-hour
+`Retry-After` therefore put `gpt-5.6-sol` behind the same clock. Claude Code
+received only SSE pings, cancelled each request after 300 seconds, retried, and
+repeated the delay. A successful buffered CCR request did not clear the
+streaming circuit, producing alternating fast and five-minute turns.
+
+Evidence:
+- `hr_1785086833_000365` recorded the original Sonnet 429 and deferred route
+  `c3d75421e869eea3423e` for 21600 seconds.
+- `hr_1785104387_001210` and `hr_1785104696_001224` were Sol requests that
+  inherited the same route without reaching upstream and ended at 300170 ms
+  and 300021 ms.
+- Their buffered retries `hr_1785104688_001219` and
+  `hr_1785104997_001235` reached sub2api and completed in 7440 ms and 22585 ms.
+
+Fix:
+- Include the normalized requested model in `upstream_route_key` and pass that
+  scope through every streaming, buffered, 429, 5xx, and transport hold.
+- Clear the matching circuit after any non-held successful/non-retryable
+  upstream response on both response paths.
+- Preserve same-model singleflight and long `Retry-After` behavior; do not
+  replace the continuity layer with raw client-visible 429 errors.
+
+Required proof:
+- A deferred Sonnet key has positive remaining time while a Sol key with the
+  same URL and credential has zero.
+- A successful buffered Sol response clears a stale Sol circuit.
+- Existing recovery, cancellation, deadline, transport, and streaming suites
+  remain green after the key change.

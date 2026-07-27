@@ -17,6 +17,7 @@ from headroom.proxy.upstream_cooldown import (
     cooldown_delay_seconds,
     get_upstream_cooldown_gate,
     should_hold_status,
+    upstream_route_key,
 )
 
 
@@ -125,6 +126,24 @@ def test_retry_after_is_not_capped_by_ordinary_30_second_backoff() -> None:
     )
 
     assert cooldown_delay_seconds(response, policy, 21600) == 2700
+
+
+def test_cooldown_route_is_scoped_by_model() -> None:
+    async def scenario() -> None:
+        owner = _Owner()
+        gate = get_upstream_cooldown_gate(owner)
+        url = "http://sub2api:8080/v1/messages"
+        headers = {"authorization": "Bearer stable-group-key"}
+        sonnet_key = upstream_route_key(url, headers, model="claude-sonnet-5")
+        sol_key = upstream_route_key(url, headers, model="gpt-5.6-sol")
+
+        gate.defer(sonnet_key, 60)
+
+        assert sonnet_key != sol_key
+        assert gate.remaining(sonnet_key) > 0
+        assert gate.remaining(sol_key) == 0
+
+    asyncio.run(scenario())
 
 
 def test_recovery_policy_holds_only_configured_transient_statuses(

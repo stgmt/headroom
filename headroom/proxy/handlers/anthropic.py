@@ -40,6 +40,7 @@ from headroom.proxy.upstream_cooldown import (
     cooldown_delay_seconds,
     get_upstream_cooldown_gate,
     should_hold_status,
+    upstream_route_key,
 )
 
 logger = logging.getLogger("headroom.proxy")
@@ -2737,6 +2738,7 @@ class AnthropicHandlerMixin:
                     outbound_headers=replay_headers,
                     request_id=request_id,
                     policy=recovery_policy,
+                    model=model,
                     initial_delay_seconds=delay_seconds,
                     initial_status_code=initial_status,
                     json_mode=True,
@@ -2910,6 +2912,10 @@ class AnthropicHandlerMixin:
                             stage_timer.summary()["upstream_connect"],
                         )
                     await _finalize_pre_upstream()
+                    if not should_hold_status(response.status_code, recovery_policy):
+                        get_upstream_cooldown_gate(self).clear(
+                            upstream_route_key(url, headers, model=model)
+                        )
                     # Claude Code also issues buffered ``stream:false`` turns
                     # (notably compact and fallback probes). Returning a raw
                     # provider 429 terminates those turns, while an SSE ping is

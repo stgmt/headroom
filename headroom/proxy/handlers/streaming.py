@@ -1189,7 +1189,7 @@ class StreamingMixin:
             cooldown_policy = UpstreamCooldownPolicy.from_env()
             cooldown_eligible = cooldown_policy.enabled and provider == "anthropic"
             cooldown_gate = get_upstream_cooldown_gate(self)
-            cooldown_key = upstream_route_key(url, outbound_headers)
+            cooldown_key = upstream_route_key(url, outbound_headers, model=model)
 
             # Do not hammer sub2api again when another Claude request already
             # discovered a subscription cooldown. The held stream emits Anthropic
@@ -1203,6 +1203,7 @@ class StreamingMixin:
                     outbound_headers=outbound_headers,
                     request_id=request_id,
                     policy=cooldown_policy,
+                    model=model,
                 )
 
             for attempt in range(retry_attempts) if upstream_response is None else ():
@@ -1257,6 +1258,7 @@ class StreamingMixin:
                             outbound_headers=outbound_headers,
                             request_id=request_id,
                             policy=cooldown_policy,
+                            model=model,
                             initial_status_code=hold_status,
                         )
                         break
@@ -1309,6 +1311,7 @@ class StreamingMixin:
                                 outbound_headers=outbound_headers,
                                 request_id=request_id,
                                 policy=cooldown_policy,
+                                model=model,
                                 initial_delay_seconds=cooldown_policy.default_retry_seconds,
                                 initial_status_code=503,
                             )
@@ -1329,6 +1332,10 @@ class StreamingMixin:
 
             if upstream_response is None:
                 raise last_connect_error or RuntimeError("upstream connection did not start")
+            if not isinstance(upstream_response, CooldownHeldStream) and not should_hold_status(
+                upstream_response.status_code, cooldown_policy
+            ):
+                cooldown_gate.clear(cooldown_key)
         # Retries exhausted (or a transport failure escaped the loop): emit a
         # clean SSE error instead of letting an h2 StreamReset bubble up as a
         # 502. Covers ConnectError/timeouts and Local/RemoteProtocolError. (#1639)

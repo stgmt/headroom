@@ -14,6 +14,10 @@ from fastapi import Request
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.models import ProxyConfig
+from headroom.proxy.upstream_cooldown import (
+    get_upstream_cooldown_gate,
+    upstream_route_key,
+)
 
 
 class _DummyTokenizer:
@@ -244,6 +248,38 @@ def test_anthropic_http_happy_path_emits_stage_timings(stage_log_capture):
     path, emitted = handler.metrics.stage_timings[-1]
     assert path == "anthropic_messages"
     assert "total_pre_upstream" in emitted
+
+
+def test_anthropic_buffered_success_clears_stale_model_cooldown() -> None:
+    async def scenario() -> None:
+        model = "gpt-5.6-sol"
+        headers = {"authorization": "Bearer stable-group-key"}
+        url = "https://api.anthropic.com/v1/messages"
+        request = _build_request(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+            headers,
+        )
+        handler = _DummyAnthropicHandler()
+        gate = get_upstream_cooldown_gate(handler)
+        key = upstream_route_key(url, headers, model=model)
+        gate.defer(key, 60)
+
+        import headroom.tokenizers as _tk
+
+        orig_get = _tk.get_tokenizer
+        _tk.get_tokenizer = lambda selected_model: _DummyTokenizer()
+        try:
+            await handler.handle_anthropic_messages(request)
+        finally:
+            _tk.get_tokenizer = orig_get
+
+        assert gate.remaining(key) == 0
+
+    anyio.run(scenario)
 
 
 @pytest.mark.parametrize("failure_kind", ["429", "503", "transport"])
