@@ -527,3 +527,43 @@ Required proof:
 - Re-enabling either instruction compression flag makes the regression fail.
 - The live container reports both compression flags as zero and a real text
   turn remains semantically equivalent to the screenshot control.
+
+## 2026-08-10: Telemetry finalizer broke an already successful SSE
+
+Problem:
+Claude Code windows reported generic API errors although the provider and
+sub2api had completed HTTP 200 responses with real token usage. Headroom logged
+`Exception in ASGI application` and retained stale
+`proxy_inbound.active` requests.
+
+Mechanism:
+The nested streaming generator executed `tags = dict(tags or {})` in its
+`finally` block. Python therefore classified `tags` as a generator-local
+variable and raised `UnboundLocalError` while evaluating the right-hand side.
+The upstream response had succeeded, but post-stream telemetry corrupted the
+client-visible EOF.
+
+Fix:
+- Build a separate `final_tags = dict(tags or {})` value and pass
+  `tags=final_tags` to `_finalize_stream_response`.
+- Catch telemetry-finalization exceptions after output without catching
+  `asyncio.CancelledError` or replaying a request whose output started.
+- Keep the repair in the paired sub2api Docker patch so rebuilding only
+  Headroom activates it without replacing a healthy sub2api container.
+
+Files:
+- `stgmt/sub2api/deploy/claude-code-codex-headroom/patch-headroom-claude-code-streaming.py`
+- `stgmt/sub2api/deploy/claude-code-codex-headroom/test_headroom_claude_code_streaming_patch.py`
+- `stgmt/sub2api/deploy/claude-code-codex-headroom/mutate_headroom_claude_code_streaming_patch_tests.py`
+
+Required proof:
+- Correlate every ASGI exception with the successful sub2api row. The observed
+  incident had 14 matching pairs.
+- Execute the complete `message_start -> content -> message_stop -> clean EOF`
+  path and inject a failing telemetry finalizer.
+- Kill mutations that restore the local `tags` assignment or remove the
+  non-fatal finalizer guard.
+- Rebuild and replace only Headroom, preserve the sub2api container ID/start
+  time, and verify CUDA remains available.
+- Require zero new ASGI/`UnboundLocalError` entries, no growing active-request
+  gap, and a successful live `claude --print`.
