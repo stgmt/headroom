@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
+from headroom.proxy.claude_stream_recovery import AnthropicCheckpointRelay
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -1122,6 +1123,10 @@ class StreamingMixin:
             body_mutated=body_mutated,
         )
         outbound_headers = {**headers, "content-type": "application/json"}
+        # sub2api downstream Claude Code stream trace patch
+        # Carry one stable id through Headroom -> sub2api -> request logs.
+        outbound_headers.setdefault("x-request-id", request_id)
+        outbound_headers["x-headroom-request-id"] = request_id
         log_outbound_request(
             forwarder="streaming",
             method="POST",
@@ -1170,6 +1175,9 @@ class StreamingMixin:
             # not corrupt downstream parsing.
             "sse_buffer": bytearray(),
             "ttfb_ms": None,  # Time to first byte from upstream
+            "chunks_yielded": 0,
+            "terminal_event_seen": False,
+            "stream_error": None,
         }
 
         # Track if we need to handle memory tools
@@ -1474,6 +1482,21 @@ class StreamingMixin:
             or k.lower().startswith("x-codex")
             or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
+        forwarded_headers["x-headroom-request-id"] = request_id
+        forwarded_headers.setdefault("x-request-id", request_id)
+        claude_stream_relay = None
+        recovery_store = getattr(self, "claude_stream_recovery", None)
+        if (
+            provider == "anthropic"
+            and session_key.startswith("claude-code:")
+            and recovery_store is not None
+            and recovery_store.enabled
+        ):
+            claude_stream_relay = AnthropicCheckpointRelay(
+                store=recovery_store,
+                session_key=session_key,
+                request_id=request_id,
+            )
 
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
@@ -1519,9 +1542,19 @@ class StreamingMixin:
                             tail = bytes(stream_state["sse_buffer"][-MAX_SSE_BUFFER_SIZE // 2 :])
                             stream_state["sse_buffer"] = bytearray(tail)
 
-                        # Always stream immediately — buffering breaks
-                        # real-time clients (LangGraph, LangChain, etc.)
-                        yield chunk
+                        # Claude Code keeps text streaming live, while complete
+                        # tool-use blocks are released atomically. Other clients
+                        # retain byte-for-byte immediate forwarding.
+                        delivered_chunks = (
+                            claude_stream_relay.feed(chunk)
+                            if claude_stream_relay is not None
+                            else [chunk]
+                        )
+                        for delivered_chunk in delivered_chunks:
+                            stream_state["chunks_yielded"] += 1
+                            if b"message_stop" in delivered_chunk:
+                                stream_state["terminal_event_seen"] = True
+                            yield delivered_chunk
 
                         if _codex_wire_debug:
                             capture_codex_wire_debug(
@@ -1578,6 +1611,36 @@ class StreamingMixin:
                                 stream_state["cache_creation_ephemeral_1h_input_tokens"] = usage[
                                     "cache_creation_ephemeral_1h_input_tokens"
                                 ]
+
+                        if claude_stream_relay is not None and claude_stream_relay.terminal:
+                            break
+
+                if claude_stream_relay is not None and not claude_stream_relay.terminal:
+                    terminal_chunks = claude_stream_relay.finish("missing_terminal_event")
+                    if terminal_chunks:
+                        logger.warning(
+                            "event=claude_stream_checkpoint request_id=%s session_key=%s "
+                            "reason=missing_terminal_event",
+                            request_id,
+                            session_key,
+                        )
+                        for terminal_chunk in terminal_chunks:
+                            stream_state["chunks_yielded"] += 1
+                            if b"message_stop" in terminal_chunk:
+                                stream_state["terminal_event_seen"] = True
+                            yield terminal_chunk
+                    elif not claude_stream_relay.message_started:
+                        error_event = {
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": "Upstream stream ended before message_start",
+                            },
+                        }
+                        stream_state["chunks_yielded"] += 1
+                        yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+                if claude_stream_relay is not None and claude_stream_relay.checkpointed:
+                    stream_state["stream_error"] = claude_stream_relay.checkpoint_reason
 
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
@@ -1659,30 +1722,141 @@ class StreamingMixin:
                         status_code=upstream_response.status_code,
                         metadata={"total_bytes": stream_state["total_bytes"]},
                     )
-                completed_normally = True
+                completed_normally = (
+                    claude_stream_relay is None
+                    or (
+                        claude_stream_relay.message_stopped
+                        and not claude_stream_relay.checkpointed
+                    )
+                )
 
+            except asyncio.CancelledError:
+                stream_state["stream_error"] = "client_disconnect_or_cancel"
+                logger.warning(
+                    "event=claude_code_stream_cancelled request_id=%s "
+                    "chunks_yielded=%s bytes=%s output_started=%s",
+                    request_id,
+                    stream_state["chunks_yielded"],
+                    stream_state["total_bytes"],
+                    stream_state["chunks_yielded"] > 0,
+                )
+                raise
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                stream_state["stream_error"] = "upstream_connection_error"
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
-                error_event = {
-                    "type": "error",
-                    "error": {
-                        "type": "connection_error",
-                        "message": f"Failed to connect to upstream API: {e}",
-                    },
-                }
-                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+                checkpoint = (
+                    claude_stream_relay.finish("connection_error")
+                    if claude_stream_relay is not None
+                    else []
+                )
+                if checkpoint:
+                    logger.warning(
+                        "event=claude_stream_checkpoint request_id=%s session_key=%s "
+                        "reason=connection_error",
+                        request_id,
+                        session_key,
+                    )
+                    for terminal_chunk in checkpoint:
+                        stream_state["chunks_yielded"] += 1
+                        if b"message_stop" in terminal_chunk:
+                            stream_state["terminal_event_seen"] = True
+                        yield terminal_chunk
+                else:
+                    error_event = {
+                        "type": "error",
+                        "error": {
+                            "type": "connection_error",
+                            "message": f"Failed to connect to upstream API: {e}",
+                        },
+                    }
+                    stream_state["chunks_yielded"] += 1
+                    yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except httpx.HTTPStatusError as e:
+                stream_state["stream_error"] = "upstream_http_error"
                 logger.error(f"[{request_id}] HTTP error from upstream API: {e}")
-                # Forward the upstream error response
-                yield e.response.content
+                checkpoint = (
+                    claude_stream_relay.finish("http_status_error")
+                    if claude_stream_relay is not None
+                    else []
+                )
+                if checkpoint:
+                    logger.warning(
+                        "event=claude_stream_checkpoint request_id=%s session_key=%s "
+                        "reason=http_status_error",
+                        request_id,
+                        session_key,
+                    )
+                    for terminal_chunk in checkpoint:
+                        stream_state["chunks_yielded"] += 1
+                        if b"message_stop" in terminal_chunk:
+                            stream_state["terminal_event_seen"] = True
+                        yield terminal_chunk
+                else:
+                    # Forward the upstream error response before message_start.
+                    yield e.response.content
             except Exception as e:
+                stream_state["stream_error"] = type(e).__name__
                 logger.error(f"[{request_id}] Unexpected streaming error: {e}")
-                error_event = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
-                }
-                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+                checkpoint = (
+                    claude_stream_relay.finish("stream_transport_error")
+                    if claude_stream_relay is not None
+                    else []
+                )
+                if checkpoint:
+                    logger.warning(
+                        "event=claude_stream_checkpoint request_id=%s session_key=%s "
+                        "reason=stream_transport_error",
+                        request_id,
+                        session_key,
+                    )
+                    for terminal_chunk in checkpoint:
+                        stream_state["chunks_yielded"] += 1
+                        if b"message_stop" in terminal_chunk:
+                            stream_state["terminal_event_seen"] = True
+                        yield terminal_chunk
+                else:
+                    error_event = {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": str(e)},
+                    }
+                    stream_state["chunks_yielded"] += 1
+                    yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             finally:
+                try:
+                    final_tags = dict(tags or {})
+                    final_tags.update(
+                        {
+                            "stream_chunks_yielded": str(stream_state["chunks_yielded"]),
+                            "stream_bytes_yielded": str(stream_state["total_bytes"]),
+                            "stream_output_started": str(
+                                stream_state["chunks_yielded"] > 0
+                            ).lower(),
+                            "stream_terminal_event": str(
+                                stream_state["terminal_event_seen"]
+                            ).lower(),
+                            "stream_error": str(stream_state["stream_error"] or ""),
+                            "stream_completed_normally": str(completed_normally).lower(),
+                        }
+                    )
+                    logger.info(
+                        "event=claude_code_stream_finalized request_id=%s "
+                        "chunks_yielded=%s bytes=%s output_started=%s terminal_event=%s "
+                        "completed_normally=%s error=%s",
+                        request_id,
+                        stream_state["chunks_yielded"],
+                        stream_state["total_bytes"],
+                        stream_state["chunks_yielded"] > 0,
+                        stream_state["terminal_event_seen"],
+                        completed_normally,
+                        stream_state["stream_error"] or "",
+                    )
+                except Exception as trace_error:
+                    final_tags = {}
+                    logger.exception(
+                        "event=claude_code_stream_trace_failed request_id=%s error_type=%s",
+                        request_id,
+                        type(trace_error).__name__,
+                    )
                 pending_messages = self._cleanup_mid_turn_stream(
                     session_key,
                     drain_pending_messages=completed_normally,
@@ -1708,28 +1882,38 @@ class StreamingMixin:
                     # are forbidden in this module per PR-A8 / P1-8.
                     decoder = __import__("codecs").getincrementaldecoder("utf-8")()
                     _final_full_sse_data = decoder.decode(bytes(full_sse_bytes), final=False)
-                await self._finalize_stream_response(
-                    body=body,
-                    provider=provider,
-                    outcome_provider=outcome_provider,
-                    model=model,
-                    request_id=request_id,
-                    original_tokens=original_tokens,
-                    optimized_tokens=optimized_tokens,
-                    tokens_saved=tokens_saved,
-                    transforms_applied=transforms_applied,
-                    optimization_latency=optimization_latency,
-                    stream_state=stream_state,
-                    start_time=start_time,
-                    tags=tags,
-                    pipeline_timing=pipeline_timing,
-                    prefix_tracker=prefix_tracker,
-                    original_messages=original_messages,
-                    full_sse_data=_final_full_sse_data,
-                    parsed_response=parsed_response,
-                    client=client,
-                    waste_signals=waste_signals,
-                )
+                try:
+                    await self._finalize_stream_response(
+                        body=body,
+                        provider=provider,
+                        outcome_provider=outcome_provider,
+                        model=model,
+                        request_id=request_id,
+                        original_tokens=original_tokens,
+                        optimized_tokens=optimized_tokens,
+                        tokens_saved=tokens_saved,
+                        transforms_applied=transforms_applied,
+                        optimization_latency=optimization_latency,
+                        stream_state=stream_state,
+                        start_time=start_time,
+                        tags=final_tags,
+                        pipeline_timing=pipeline_timing,
+                        prefix_tracker=prefix_tracker,
+                        original_messages=original_messages,
+                        full_sse_data=_final_full_sse_data,
+                        parsed_response=parsed_response,
+                        client=client,
+                        waste_signals=waste_signals,
+                    )
+                except Exception as finalize_error:
+                    logger.exception(
+                        "event=claude_code_stream_finalize_failed request_id=%s "
+                        "error_type=%s output_started=%s terminal_event=%s",
+                        request_id,
+                        type(finalize_error).__name__,
+                        stream_state["chunks_yielded"] > 0,
+                        stream_state["terminal_event_seen"],
+                    )
                 if pending_messages:
                     pending_event = json.dumps(
                         {"type": "headroom_pending_messages", "messages": pending_messages}

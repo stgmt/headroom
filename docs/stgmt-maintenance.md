@@ -15,6 +15,7 @@ Keep the Claude Code + Headroom + sub2api/Codex subscription path reliable while
 - Claude Code mid-turn overlap wait instead of private 202 queue response.
 - Active-stream refcounts.
 - Claude Code handler watchdog with one bypass/passthrough retry before 504.
+- Claude Code partial-stream checkpoints with atomic `tool_use`, a persistent one-shot recovery ledger, and `Stop`/`SubagentStop` continuation hooks owned by the paired sub2api skill.
 - Embedding server sidecar module and socket embedder factory path.
 - Optional CUDA PyTorch Kompress runtime through the sub2api GPU image stage and compose overlay.
 - Durable `/stats.request_history` hydration from the persisted request JSONL across process/container restarts.
@@ -24,7 +25,7 @@ Keep the Claude Code + Headroom + sub2api/Codex subscription path reliable while
 Run focused tests:
 
 ```powershell
-python -m pytest tests/test_stgmt_claude_code_recovery.py tests/test_cli_proxy_embedding_server.py tests/test_mid_turn_steering.py
+python -m pytest tests/test_stgmt_claude_code_recovery.py tests/test_cli_proxy_embedding_server.py tests/test_mid_turn_steering.py tests/test_claude_stream_checkpoint_recovery.py tests/test_h2_stream_reset_retry.py
 ```
 
 Static checks:

@@ -110,6 +110,7 @@ from headroom.proxy import runtime_env
 from headroom.proxy.audit import is_auditable_path, record_admin_action
 from headroom.proxy.auth_mode import should_stamp_codex_client
 from headroom.proxy.background_compression import BackgroundCompressor
+from headroom.proxy.claude_stream_recovery import ClaudeStreamRecoveryStore
 
 # =============================================================================
 # Extracted modules (re-exported for backward compatibility)
@@ -650,6 +651,9 @@ class HeadroomProxy(
         from headroom import paths as _hr_paths
 
         _hr_paths.set_process_stateless(config.stateless)
+        self.claude_stream_recovery = ClaudeStreamRecoveryStore.from_environment(
+            stateless=config.stateless
+        )
         # Stateless: keep TOIN learning in-memory; never touch toin.json.
         _apply_stateless_persistence(self.config)
         pipeline_extensions = list(config.pipeline_extensions or [])
@@ -2391,6 +2395,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "hold_statuses": sorted(recovery_policy.hold_statuses),
                 **recovery_snapshot,
             },
+            "claude_stream_recovery": proxy.claude_stream_recovery.stats(),
         }
 
     def _loop_callback_payload() -> LoopHealthState:
@@ -2856,6 +2861,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # remain the unauthenticated probes for orchestration health.
         payload = _health_payload(include_config=_request_is_loopback(request))
         return JSONResponse(status_code=200, content=payload)
+
+    @app.post("/__headroom/claude-recovery/consume")
+    async def consume_claude_stream_recovery(request: Request):
+        """Atomically consume one pending Claude Code continuation marker."""
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+        session_id = payload.get("session_id") if isinstance(payload, dict) else None
+        agent_id = payload.get("agent_id", "main") if isinstance(payload, dict) else "main"
+        if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 256:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        if not isinstance(agent_id, str) or not agent_id.strip() or len(agent_id) > 256:
+            raise HTTPException(status_code=400, detail="agent_id is invalid")
+        if any(ord(char) < 32 for char in session_id + agent_id):
+            raise HTTPException(status_code=400, detail="session or agent id contains control bytes")
+        session_key = f"claude-code:{session_id.strip()}:{agent_id.strip()}"
+        return proxy.claude_stream_recovery.consume(session_key)
 
     # Loopback-only debug introspection (Unit 5). A remote IP gets 404 —
     # debug endpoints are invisible to external scanners.

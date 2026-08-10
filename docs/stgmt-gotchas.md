@@ -567,3 +567,52 @@ Required proof:
   time, and verify CUDA remains available.
 - Require zero new ASGI/`UnboundLocalError` entries, no growing active-request
   gap, and a successful live `claude --print`.
+
+## 2026-08-11: A valid first SSE event still did not preserve Claude autonomy
+
+Problem:
+A provider connection could fail after Claude Code had already received text.
+Headroom then forwarded `event: error`. Retrying the original request at that
+point was unsafe because visible text or a tool call might be duplicated, while
+the error made Claude Code stop the turn and wait for a user prompt.
+
+Mechanism:
+- Claude Code's `StopFailure` hook cannot continue a failed API turn; its output
+  and exit code are ignored.
+- A normal `Stop` or `SubagentStop` hook can return `decision: block`. Claude
+  Code injects that hook feedback as a meta user message and starts another
+  model request under the same session id.
+- Tool JSON cannot be streamed speculatively across this boundary. A truncated
+  `tool_use` would later produce an unmatched or invalid `tool_result`.
+
+Fix (F46):
+- `AnthropicCheckpointRelay` forwards text/reasoning frames immediately but
+  holds each `tool_use`/`server_tool_use` block until `content_block_stop`.
+- After `message_start`, an SSE error, transport exception, or clean EOF without
+  `message_stop` is converted to legal `content_block_stop` + `message_delta` +
+  `message_stop`; no client-visible `event: error` is emitted.
+- Incomplete tool frames are discarded. Completed tool blocks are released
+  atomically and retain `stop_reason=tool_use` so the ordinary tool-result turn
+  continues without a hook.
+- A SQLite ledger under the persistent Headroom workspace stores a one-shot
+  marker keyed by `claude-code:<session-id>:<agent-id>`. Normal completion
+  clears the chain; TTL and `HEADROOM_CLAUDE_STREAM_RECOVERY_MAX_ATTEMPTS`
+  prevent loops.
+- The paired sub2api skill installs one cross-platform Node hook for `Stop` and
+  `SubagentStop`. It consumes `/__headroom/claude-recovery/consume` and asks the
+  model to resume the exact unfinished step without repeating completed side
+  effects. Hook/network failure is fail-open.
+- Failures before `message_start` remain real API errors because there is no
+  assistant turn to checkpoint safely.
+
+Required proof:
+- Unit tests cover split TCP frames, partial text, incomplete tool JSON,
+  complete tool atomicity, missing terminal events, one-shot consumption,
+  normal-chain cleanup, and retry exhaustion.
+- The real `_stream_response` path converts an injected HTTP/2 body reset after
+  visible text to `message_stop` and creates the matching marker.
+- The host hook receives the same session/agent ids and emits `decision:block`
+  only when a pending marker exists.
+- Final production proof must show one external Claude prompt, two downstream
+  model requests in the same transcript, no user message between them, no
+  duplicate tool side effect, and a clean second `message_stop`.

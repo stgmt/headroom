@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from headroom.proxy.claude_stream_recovery import ClaudeStreamRecoveryStore
 from headroom.proxy.server import HeadroomProxy
 
 
@@ -142,3 +143,43 @@ async def test_stream_reset_exhaustion_yields_sse_error_not_crash():
     assert proxy.http_client.send.await_count == 2
     assert b"event: error" in body
     assert b"connection_error" in body
+
+
+@pytest.mark.asyncio
+async def test_claude_stream_reset_after_visible_text_yields_checkpoint(tmp_path):
+    proxy = _mock_proxy()
+    proxy.claude_stream_recovery = ClaudeStreamRecoveryStore(
+        tmp_path / "recovery.sqlite3",
+        ttl_seconds=300,
+        max_attempts=3,
+    )
+    response = AsyncMock()
+    response.headers = httpx.Headers({"content-type": "text/event-stream"})
+    response.status_code = 200
+
+    async def aiter_bytes():
+        yield b'event: message_start\ndata: {"type":"message_start"}\n\n'
+        yield (
+            b'event: content_block_start\ndata: {"type":"content_block_start",'
+            b'"index":0,"content_block":{"type":"text","text":""}}\n\n'
+        )
+        yield (
+            b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+            b'"index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n'
+        )
+        raise httpx.RemoteProtocolError("peer closed connection")
+
+    response.aiter_bytes = aiter_bytes
+    response.aclose = AsyncMock()
+    proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+    proxy.http_client.send = AsyncMock(return_value=response)
+
+    result = await _run_stream(proxy, session_key="claude-code:session-reset:main")
+    body = b"".join([chunk async for chunk in result.body_iterator])
+
+    assert b"partial" in body
+    assert b"event: error" not in body
+    assert body.endswith(b'event: message_stop\ndata: {"type": "message_stop"}\n\n')
+    marker = proxy.claude_stream_recovery.consume("claude-code:session-reset:main")
+    assert marker["pending"] is True
+    assert marker["reason"] == "stream_transport_error"
