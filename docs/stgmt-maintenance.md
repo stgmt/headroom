@@ -40,6 +40,18 @@ Runtime proof lives in the sub2api stack verifier:
 powershell -NoProfile -ExecutionPolicy Bypass -File backend/docs/skills/sub2api-claude-code-codex/scripts/verify-claude-code-sub2api.ps1 -BaseUrl http://<wsl-ip>:8787 -SkipApiProbe -SkipClaudeProbe
 ```
 
+F46 end-to-end proof also lives in the paired sub2api skill:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File backend/docs/skills/sub2api-claude-code-codex/scripts/prove-claude-stream-recovery.ps1
+```
+
+It must report `claude_exit=0`, `upstream_requests=2`,
+`unique_session_ids=1`, `first_part_seen=true`, and
+`second_pass_seen=true`. `console_checkpoint_events` is informational because
+the configured logger may not write structured recovery events to Docker
+stdout.
+
 Expected runtime marker:
 `WATCHDOG_RETRY_OK attempts=2 response=WATCHDOG_RETRY_RESPONSE`
 

@@ -616,3 +616,9 @@ Required proof:
 - Final production proof must show one external Claude prompt, two downstream
   model requests in the same transcript, no user message between them, no
   duplicate tool side effect, and a clean second `message_stop`.
+- Run the paired sub2api skill command
+  `scripts/prove-claude-stream-recovery.ps1`. Its machine-readable pass
+  criteria are `claude_exit=0`, `upstream_requests=2`,
+  `unique_session_ids=1`, `first_part_seen=true`, and
+  `second_pass_seen=true`. A zero `console_checkpoint_events` count is not a
+  failure when structured logs use a non-stdout sink.
