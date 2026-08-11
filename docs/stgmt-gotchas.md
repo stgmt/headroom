@@ -622,3 +622,33 @@ Required proof:
   `unique_session_ids=1`, `first_part_seen=true`, and
   `second_pass_seen=true`. A zero `console_checkpoint_events` count is not a
   failure when structured logs use a non-stdout sink.
+
+## 2026-08-11: Live Claude Code SSE cannot use Headroom's private buffered CCR tool
+
+Problem:
+Claude Code reported `Stream idle timeout - no chunks received` after a long
+turn even though Headroom kept retrying the provider. The incident trace showed
+an outer `/v1/messages` request with `stream:true`, while Headroom changed the
+inner provider request to `stream:false` to intercept `headroom_retrieve`.
+When sub2api returned 502, that buffered branch sent JSON whitespace keepalives
+instead of Anthropic SSE events, so Claude Code had no valid stream to consume.
+
+Fix (F47):
+- For a classified `claude-code` live stream, do not inject the private
+  `headroom_retrieve` tool. Strip a sticky copy left by an older proxy version
+  before forwarding as a defensive guard.
+- Preserve the native `stream:true` provider request and route it through the
+  normal SSE/recovery path. Other Headroom transformations still apply.
+- Keep server-side CCR retrieval for buffered `stream:false` requests, where a
+  JSON response is valid.
+- Keep `429` on its full configured `Retry-After` budget, but cap generic
+  `502/503/504/529` hold windows with
+  `HEADROOM_UPSTREAM_TRANSIENT_MAX_WAIT_SECONDS` (default: 90 seconds), rather
+  than allowing a temporary overload to hold an interactive turn for hours.
+
+Required proof:
+- A `claude-code` `stream:true` request containing the private tool reaches
+  `_stream_response` with `stream:true` and without `headroom_retrieve`.
+- A non-Claude client keeps the buffered CCR behavior unchanged.
+- A 502 uses the transient cap while a 429 retains the full long cooldown
+  budget.

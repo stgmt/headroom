@@ -223,6 +223,48 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
     proxy._stream_response.assert_not_awaited()
 
 
+def test_claude_code_stream_does_not_buffer_private_ccr_tool() -> None:
+    """A live Claude Code stream must never become a buffered JSON request."""
+    config = _make_config()
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+
+            async def _fake_stream_response(**kwargs):  # noqa: ANN003
+                async def _events():
+                    yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+                return StreamingResponse(_events(), media_type="text/event-stream")
+
+            proxy._stream_response = AsyncMock(side_effect=_fake_stream_response)
+
+            resp = client.post(
+                "/v1/messages",
+                headers={
+                    "x-api-key": "test-key",
+                    "anthropic-version": "2023-06-01",
+                    "x-client": "claude-code",
+                    "x-claude-code-session-id": "streaming-ccr-regression",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+    assert resp.status_code == 200, resp.text
+    assert "text/event-stream" in resp.headers["content-type"]
+    proxy._stream_response.assert_awaited_once()
+    forwarded_body = proxy._stream_response.await_args.kwargs["body"]
+    assert forwarded_body["stream"] is True
+    assert not proxy._has_headroom_retrieve_tool(forwarded_body.get("tools"))
+
+
 def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
     config = _make_config()
     initial_response = _message_response(

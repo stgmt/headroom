@@ -560,3 +560,39 @@ def test_disabling_hold_reproduces_client_visible_429(
         assert b"upstream 429" in response.body
 
     asyncio.run(scenario())
+
+
+def test_transient_hold_budget_is_capped_but_429_keeps_full_retry_after_budget() -> None:
+    owner = _Owner()
+    client = _FakeClient([])
+    policy = UpstreamCooldownPolicy(
+        enabled=True,
+        max_wait_seconds=21600,
+        heartbeat_seconds=1,
+        default_retry_seconds=30,
+        transient_max_wait_seconds=90,
+    )
+
+    transient = CooldownHeldStream(
+        owner=owner,
+        http_client=client,  # type: ignore[arg-type]
+        url="http://sub2api:8080/v1/messages",
+        outbound_bytes=b'{}',
+        outbound_headers={"authorization": "Bearer stable-group-key"},
+        request_id="transient-cap",
+        policy=policy,
+        initial_status_code=502,
+    )
+    rate_limited = CooldownHeldStream(
+        owner=owner,
+        http_client=client,  # type: ignore[arg-type]
+        url="http://sub2api:8080/v1/messages",
+        outbound_bytes=b'{}',
+        outbound_headers={"authorization": "Bearer stable-group-key"},
+        request_id="rate-limit-budget",
+        policy=policy,
+        initial_status_code=429,
+    )
+
+    assert transient._policy.max_wait_seconds == 90
+    assert rate_limited._policy.max_wait_seconds == 21600

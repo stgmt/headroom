@@ -364,6 +364,24 @@ class AnthropicHandlerMixin:
         return False
 
     @staticmethod
+    def _without_headroom_retrieve_tool(tools: Any) -> Any:
+        """Remove Headroom's private CCR tool from a client-owned live stream."""
+        if not isinstance(tools, list):
+            return tools
+        filtered: list[Any] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                filtered.append(tool)
+                continue
+            function = tool.get("function")
+            name = tool.get("name")
+            if isinstance(function, dict):
+                name = function.get("name")
+            if name != "headroom_retrieve":
+                filtered.append(tool)
+        return filtered
+
+    @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
         """Extract observed Anthropic cache-write TTL bucket usage.
 
@@ -1963,7 +1981,12 @@ class AnthropicHandlerMixin:
                     frozen_message_count=frozen_message_count,
                     has_compressed_content=has_new_compressed_content,
                 )
-                if should_inject:
+                # ``headroom_retrieve`` is a server-private continuation tool.
+                # A live Claude Code request must remain a real SSE stream; turning
+                # it into a buffered JSON request to intercept this tool leaves the
+                # client without an event while the upstream is unavailable.
+                claude_code_live_stream = client == "claude-code" and stream
+                if should_inject and not claude_code_live_stream:
                     if is_marker_override:
                         logger.info(
                             f"[{request_id}] CCR: overriding injection deferral — "
@@ -1986,6 +2009,11 @@ class AnthropicHandlerMixin:
                             f"compressed_this_turn={injector.has_compressed_content}, "
                             f"hashes_seen={len(injector.detected_hashes)})"
                         )
+                elif should_inject:
+                    logger.info(
+                        f"[{request_id}] CCR: skipping private headroom_retrieve "
+                        "for live Claude Code SSE; retaining the native stream"
+                    )
 
                 # CCR workspace scoping: resolve a stable project identity
                 # for the request once and reuse it for both track_compression
@@ -2763,11 +2791,21 @@ class AnthropicHandlerMixin:
                 )
                 buffered_stream_ccr = bool(
                     stream
+                    and client != "claude-code"
                     and ccr_response_handler_enabled
                     and self._has_headroom_retrieve_tool(
                         tools if tools is not None else body.get("tools")
                     )
                 )
+                # Guard against an already-sticky internal tool from an earlier
+                # proxy version. It must never reach Claude Code as a client tool.
+                if stream and client == "claude-code" and self._has_headroom_retrieve_tool(tools):
+                    tools = self._without_headroom_retrieve_tool(tools)
+                    body_mutation_tracker.mark_mutated("strip_private_ccr_tool_from_claude_stream")
+                    logger.info(
+                        f"[{request_id}] CCR: stripped sticky private retrieval tool "
+                        "from live Claude Code SSE request"
+                    )
                 if buffered_stream_ccr:
                     if body.get("stream") is not False:
                         body["stream"] = False

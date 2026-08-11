@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
@@ -69,6 +69,10 @@ class UpstreamCooldownPolicy:
     max_wait_seconds: float
     heartbeat_seconds: float
     default_retry_seconds: float
+    # A provider overload is not a subscription reset.  Keep 429 on its
+    # explicit Retry-After budget, but never park an interactive stream for
+    # hours behind a generic 5xx.
+    transient_max_wait_seconds: float = 90.0
     hold_statuses: frozenset[int] = frozenset({429, 502, 503, 504, 529})
 
     @classmethod
@@ -83,6 +87,9 @@ class UpstreamCooldownPolicy:
             ),
             default_retry_seconds=_env_float(
                 "HEADROOM_UPSTREAM_429_DEFAULT_RETRY_SECONDS", 30.0, minimum=0.05
+            ),
+            transient_max_wait_seconds=_env_float(
+                "HEADROOM_UPSTREAM_TRANSIENT_MAX_WAIT_SECONDS", 90.0, minimum=1.0
             ),
             hold_statuses=_env_statuses(
                 "HEADROOM_UPSTREAM_RECOVERY_HOLD_STATUSES",
@@ -270,7 +277,12 @@ class CooldownHeldStream:
         self._outbound_bytes = outbound_bytes
         self._outbound_headers = outbound_headers
         self._request_id = request_id
-        self._policy = policy
+        effective_max_wait = (
+            policy.max_wait_seconds
+            if initial_status_code == 429
+            else min(policy.max_wait_seconds, policy.transient_max_wait_seconds)
+        )
+        self._policy = replace(policy, max_wait_seconds=effective_max_wait)
         self._route_key = upstream_route_key(url, outbound_headers, model=model)
         self._initial_delay_seconds = initial_delay_seconds
         self._initial_status_code = initial_status_code
