@@ -232,7 +232,7 @@ def test_claude_code_stream_does_not_buffer_private_ccr_tool() -> None:
         with TestClient(app) as client:
             proxy = client.app.state.proxy
 
-            async def _fake_stream_response(**kwargs):  # noqa: ANN003
+            async def _fake_stream_response(*_args, **_kwargs):  # noqa: ANN002, ANN003
                 async def _events():
                     yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
@@ -260,7 +260,7 @@ def test_claude_code_stream_does_not_buffer_private_ccr_tool() -> None:
     assert resp.status_code == 200, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
     proxy._stream_response.assert_awaited_once()
-    forwarded_body = proxy._stream_response.await_args.kwargs["body"]
+    forwarded_body = proxy._stream_response.await_args.args[2]
     assert forwarded_body["stream"] is True
     assert not proxy._has_headroom_retrieve_tool(forwarded_body.get("tools"))
 

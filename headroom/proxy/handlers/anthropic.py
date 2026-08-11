@@ -2801,6 +2801,7 @@ class AnthropicHandlerMixin:
                 # proxy version. It must never reach Claude Code as a client tool.
                 if stream and client == "claude-code" and self._has_headroom_retrieve_tool(tools):
                     tools = self._without_headroom_retrieve_tool(tools)
+                    body["tools"] = tools
                     body_mutation_tracker.mark_mutated("strip_private_ccr_tool_from_claude_stream")
                     logger.info(
                         f"[{request_id}] CCR: stripped sticky private retrieval tool "
