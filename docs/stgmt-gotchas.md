@@ -652,3 +652,20 @@ Required proof:
 - A non-Claude client keeps the buffered CCR behavior unchanged.
 - A 502 uses the transient cap while a 429 retains the full long cooldown
   budget.
+
+## 2026-08-13: Upstream lifecycle traffic is not Claude stream liveness
+
+Problem:
+sub2api received OpenAI Responses lifecycle frames for minutes but emitted no
+Anthropic SSE bytes before `message_start`. Claude Code stopped on its idle
+deadline, while the upstream later ended with an HTTP/2 `INTERNAL_ERROR`.
+
+Fix (F49/F50):
+- Emit Anthropic `ping` based on time since the last downstream write, including
+  before semantic output. A ping must not mark the response as semantically
+  started, so exactly one pre-output H2-to-H1 retry remains safe.
+- Keep sub2api's internal shutdown grace at `85s` under Docker's `90s` grace;
+  the previous hardcoded `5s` deadline could cut healthy streams during rollout.
+- Prove delayed fault, delayed success with exactly one semantic sequence,
+  retry guard, duration parsing, rendered compose, rebuilt revision, and a real
+  Claude request.
