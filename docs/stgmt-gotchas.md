@@ -2,6 +2,23 @@
 
 This file tracks downstream Headroom behavior that was proven against Claude Code + sub2api + Codex/OpenAI subscription routing.
 
+## 2026-08-14: A long upstream hold cannot repair dead Docker DNS
+
+Problem:
+- Claude Code showed `Upstream service did not recover before the configured hold deadline`; after increasing the transient hold, even `ало` remained silent.
+- Headroom health stayed green and retained the request, but sub2api returned `502` with `lookup chatgpt.com on 127.0.0.11:53: server misbehaving`.
+- WSL had `generateResolvConf=false` and no `/etc/resolv.conf`; Docker recorded `DNS resolver has no external nameservers` and existing containers had `NO EXTERNAL NAMESERVERS DEFINED`.
+
+Fix boundary:
+- Keep Headroom's generic library default conservative. The paired `stgmt/sub2api` autonomous profile may set both `HEADROOM_UPSTREAM_429_MAX_WAIT_SECONDS=86400` and `HEADROOM_UPSTREAM_TRANSIENT_MAX_WAIT_SECONDS=86400`, but only together with explicit compose DNS and a provider-hostname watchdog. The transient limit is capped by the general max wait, so changing only the transient variable does not remove the old six-hour ceiling.
+- `repair-wsl-dns.ps1` restores WSL and running-container resolver files in place, retaining Docker's `127.0.0.11` for service discovery. This must not recreate Headroom or sub2api.
+- Unknown Docker lifecycle never authorizes recreation; a bridge-only outage uses `--no-recreate`; automatic `wsl --shutdown` requires explicit operator consent.
+
+Required proof:
+- WSL and both proxy containers resolve `chatgpt.com`.
+- A request held during the outage completes after repair without a new Claude prompt.
+- `/health.runtime.upstream_recovery.recoveries_total` increments, `timeouts_total` does not, and proxy container `StartedAt` values remain unchanged for the in-place repair path.
+
 ## 2026-07-13: Claude Code must never receive Headroom private 202 queue responses
 
 Problem:
