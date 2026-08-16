@@ -4540,32 +4540,50 @@ class OpenAIHandlerMixin:
                     if _ccr_response_handler and _ccr_response_handler.has_ccr_tool_calls(
                         resp_json, "openai_responses"
                     ):
-                        # Handling above didn't fully resolve the retrieve
-                        # call (e.g. max rounds hit, or it was mixed with a
-                        # non-CCR tool call). Fail closed rather than stream
-                        # a response the client can't act on — matches the
-                        # Anthropic buffered path's residual-CCR guard.
-                        logger.warning(
-                            f"[{request_id}] CCR: Buffered streaming Responses "
-                            "reply still contains headroom_retrieve after "
-                            "handling; failing closed"
-                        )
+                        # The handler may have intentionally skipped a mixed-tools
+                        # turn (headroom_retrieve alongside non-CCR tool calls);
+                        # then the client must resolve all tool calls itself, so
+                        # pass through instead of failing closed with 502. Only
+                        # fail closed when a residual CCR-only call survived
+                        # handling (max rounds hit or a true failure).
+                        from headroom.ccr.tool_calls import parse_ccr_tool_calls
 
-                        async def _residual_ccr_error_sse():
-                            error_event = {
-                                "type": "error",
-                                "error": {
-                                    "message": "Unable to safely complete streamed CCR retrieval.",
-                                },
-                            }
-                            yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
-
-                        return StreamingResponse(
-                            _residual_ccr_error_sse(),
-                            media_type="text/event-stream",
-                            headers=sse_headers,
-                            status_code=502,
+                        _, residual_other_calls = parse_ccr_tool_calls(
+                            resp_json, "openai_responses"
                         )
+                        if residual_other_calls:
+                            logger.warning(
+                                f"[{request_id}] CCR: Buffered streaming Responses "
+                                "reply keeps headroom_retrieve alongside non-CCR "
+                                f"tool call(s); passing through for client resolution "
+                                f"({len(residual_other_calls)} non-CCR tool(s))"
+                            )
+                        else:
+                            # Handling above didn't fully resolve the retrieve
+                            # call (e.g. max rounds hit). Fail closed rather than
+                            # stream a response the client can't act on — matches
+                            # the Anthropic buffered path's residual-CCR guard.
+                            logger.warning(
+                                f"[{request_id}] CCR: Buffered streaming Responses "
+                                "reply still contains headroom_retrieve after "
+                                "handling; failing closed"
+                            )
+
+                            async def _residual_ccr_error_sse():
+                                error_event = {
+                                    "type": "error",
+                                    "error": {
+                                        "message": "Unable to safely complete streamed CCR retrieval.",
+                                    },
+                                }
+                                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+
+                            return StreamingResponse(
+                                _residual_ccr_error_sse(),
+                                media_type="text/event-stream",
+                                headers=sse_headers,
+                                status_code=502,
+                            )
 
                     async def _buffered_ccr_sse():
                         for event in _openai_responses_to_sse(resp_json):

@@ -3565,22 +3565,45 @@ class AnthropicHandlerMixin:
                             self.ccr_response_handler
                             and self.ccr_response_handler.has_ccr_tool_calls(resp_json, "anthropic")
                         ):
-                            logger.warning(
-                                f"[{request_id}] CCR: Buffered streaming response still "
-                                "contains headroom_retrieve after handling; failing closed"
-                            )
+                            # The CCR handler may have intentionally skipped a
+                            # mixed-tools turn (headroom_retrieve alongside
+                            # non-CCR tool calls): it cannot synthesize a valid
+                            # continuation without results for the other tools.
+                            # In that case the response is meant to be returned
+                            # to the client as-is so the client resolves all
+                            # tool calls itself — failing closed with 502 kills
+                            # the agent turn for a condition that is recoverable
+                            # on the next request.
+                            from headroom.ccr.tool_calls import parse_ccr_tool_calls
 
-                            async def _residual_ccr_error_sse():
-                                yield _sse_error_event(
-                                    "Unable to safely complete streamed CCR retrieval."
+                            _, residual_other_calls = parse_ccr_tool_calls(
+                                resp_json, "anthropic"
+                            )
+                            if residual_other_calls:
+                                logger.warning(
+                                    f"[{request_id}] CCR: Buffered streaming response "
+                                    "keeps headroom_retrieve alongside non-CCR tool "
+                                    f"call(s); passing through for client resolution "
+                                    f"({len(residual_other_calls)} non-CCR tool(s))"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[{request_id}] CCR: Buffered streaming response "
+                                    "still contains headroom_retrieve after handling; "
+                                    "failing closed"
                                 )
 
-                            return StreamingResponse(
-                                _residual_ccr_error_sse(),
-                                media_type="text/event-stream",
-                                headers=sse_headers,
-                                status_code=502,
-                            )
+                                async def _residual_ccr_error_sse():
+                                    yield _sse_error_event(
+                                        "Unable to safely complete streamed CCR retrieval."
+                                    )
+
+                                return StreamingResponse(
+                                    _residual_ccr_error_sse(),
+                                    media_type="text/event-stream",
+                                    headers=sse_headers,
+                                    status_code=502,
+                                )
 
                         try:
                             sse_events = self._response_to_sse(resp_json, "anthropic")
