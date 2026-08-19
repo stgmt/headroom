@@ -659,6 +659,21 @@ def _should_buffer_openai_responses_stream_ccr(
     )
 
 
+def _is_openai_responses_provider_passthrough_model(model: Any) -> bool:
+    """Keep provider-namespace models byte-faithful on the Responses route.
+
+    Cline Pass exposes an OpenAI-compatible Chat Completions upstream behind
+    ``cline-pass/*`` model IDs. Injecting Headroom memory tools or output
+    shaping into those requests can make the compatibility bridge return an
+    empty completed Responses envelope even though the direct stream is
+    valid. These models must bypass request mutation while retaining the
+    normal authenticated proxy hop.
+    """
+
+    normalized = str(model or "").strip().lower()
+    return normalized.startswith("cline-pass/")
+
+
 def _responses_input_to_items(input_data: Any) -> list[dict[str, Any]]:
     """Normalize a Responses ``input`` field into an item list for CCR continuation.
 
@@ -3635,11 +3650,14 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
         body_mutation_tracker = BodyMutationTracker()
-        _bypass = self._headroom_bypass_enabled(request.headers)
+        _explicit_bypass = self._headroom_bypass_enabled(request.headers)
+        _provider_passthrough = _is_openai_responses_provider_passthrough_model(model)
+        _bypass = _explicit_bypass or _provider_passthrough
         if _bypass:
             logger.info(
-                "[%s] Responses passthrough reason=bypass_header mutation=disabled",
+                "[%s] Responses passthrough reason=%s mutation=disabled",
                 request_id,
+                "bypass_header" if _explicit_bypass else "provider_compat_model",
             )
 
         from headroom.proxy.helpers import capture_codex_wire_debug

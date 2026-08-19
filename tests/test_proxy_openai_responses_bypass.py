@@ -112,3 +112,61 @@ def test_responses_bypass_skips_memory_and_compression_mutation() -> None:
     assert "tools" not in captured["body"]
     assert memory_handler.search_calls == 0
     assert memory_handler.tool_calls == 0
+
+
+def test_cline_pass_responses_skip_headroom_mutation_without_bypass_header() -> None:
+    """Cline's Responses compatibility bridge must receive the original body."""
+
+    app = create_app(
+        ProxyConfig(
+            optimize=True,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+
+    original_input = "say CLINE_COMPAT_OK"
+    captured: dict[str, Any] = {}
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        memory_handler = _MemoryHandler()
+        proxy.memory_handler = memory_handler
+
+        async def _fake_retry(
+            method: str,
+            url: str,
+            headers: dict[str, str],
+            body: dict[str, Any],
+            stream: bool = False,
+            **kwargs: Any,
+        ) -> httpx.Response:
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_cline",
+                    "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/responses",
+            headers={
+                "authorization": "Bearer test-key",
+                "x-headroom-user-id": "user-1",
+            },
+            json={"model": "cline-pass/deepseek-v4-flash", "input": original_input},
+        )
+
+    assert response.status_code == 200
+    assert captured["body"]["input"] == original_input
+    assert "tools" not in captured["body"]
+    assert memory_handler.search_calls == 0
+    assert memory_handler.tool_calls == 0
