@@ -3841,7 +3841,7 @@ class OpenAIHandlerMixin:
             mode_name=get_memory_injection_mode(),
         )
         responses_memory_decision.apply_to_tags(tags)
-        if responses_memory_decision.inject:
+        if responses_memory_decision.inject and not _provider_passthrough:
             try:
                 # Memory context now routes exclusively to the live-zone tail
                 # (latest non-frozen user item). Instructions are part of the
@@ -3990,8 +3990,9 @@ class OpenAIHandlerMixin:
                 logger.warning(f"[{request_id}] Memory injection failed (responses): {e}")
         elif self.memory_handler and memory_user_id and _bypass:
             logger.info(
-                "[%s] Responses memory passthrough reason=bypass_header",
+                "[%s] Responses memory passthrough reason=%s",
                 request_id,
+                "bypass_header" if _explicit_bypass else "provider_compat_model",
             )
 
         # /v1/responses is OpenAI-specific (Codex) — always routes direct.
