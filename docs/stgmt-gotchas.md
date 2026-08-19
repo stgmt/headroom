@@ -686,3 +686,25 @@ Fix (F49/F50):
 - Prove delayed fault, delayed success with exactly one semantic sequence,
   retry guard, duration parsing, rendered compose, rebuilt revision, and a real
   Claude request.
+
+## 2026-08-19: Cline Responses requests must bypass Headroom mutation
+
+Problem:
+DSH requests for `cline-pass/*` hung in `Deep diving...` or returned an empty
+Responses envelope. Cline Pass does not implement the upstream
+`/v1/responses` endpoint, and Headroom's Responses memory/compression/output
+mutations are not compatible with the Cline bridge.
+
+Fix:
+- sub2api retries a Cline API-key Responses request through raw Chat
+  Completions when the upstream returns `404` or `405`, then converts the
+  result back to Responses SSE.
+- Headroom skips its Responses mutation pipeline for `cline-pass/*` while
+  preserving the normal pipeline for GPT, Grok, and other models.
+
+Required proof:
+- sub2api logs show `upstream_status=404`, fallback to raw Chat Completions,
+  and final `/v1/responses status_code=200`.
+- A real DSH credential through Headroom returns semantic text plus
+  `response.output_text.delta`, `response.completed`, and `[DONE]` without a
+  bypass header.
